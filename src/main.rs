@@ -1,13 +1,18 @@
 use std::collections::HashMap;
 use std::env;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::{Request, Response, StatusCode};
+use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::{ClientConfig, DigitallySignedStruct};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 use warp::{Filter, Rejection, Reply};
@@ -18,6 +23,47 @@ struct Claims {
     exp: usize,
     #[serde(flatten)]
     extra: HashMap<String, serde_json::Value>,
+}
+
+// ─── TLS: no-op verifier for self-signed / internal certs ────────────────────
+#[derive(Debug)]
+struct NoVerifier;
+
+impl ServerCertVerifier for NoVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer,
+        _intermediates: &[CertificateDer],
+        _server_name: &ServerName,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 // ─── App Config ───────────────────────────────────────────────────────────────
@@ -32,6 +78,9 @@ struct Config {
     /// Path prefixes that bypass the auth gate entirely.
     /// Set via EXCLUDED_PATHS=/health,/metrics,/public
     excluded_paths: Vec<String>,
+    /// UPSTREAM_TLS_SKIP_VERIFY=true  -> skip TLS cert verification (self-signed / internal certs)
+    /// UPSTREAM_TLS_SKIP_VERIFY=false -> verify TLS cert normally   (default)
+    upstream_tls_skip_verify: bool,
 }
 
 impl Config {
@@ -39,6 +88,10 @@ impl Config {
         let debug = env::var("DEBUG")
             .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1"))
             .unwrap_or(false);
+
+        let upstream_tls_skip_verify = env::var("UPSTREAM_TLS_SKIP_VERIFY")
+            .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1"))
+            .unwrap_or(false); // default: verify certs (safe for prod)
 
         let excluded_paths = env::var("EXCLUDED_PATHS")
             .unwrap_or_default()
@@ -49,11 +102,12 @@ impl Config {
             .collect();
 
         Config {
-            jwt_secret:     env::var("JWT_SECRET_KEY").expect("JWT_SECRET_KEY must be set"),
-            upstream_url:   env::var("UPSTREAM_URL").expect("UPSTREAM_URL must be set"),
-            iam_login_url:  env::var("IAM_LOGIN_URL").expect("IAM_LOGIN_URL must be set"),
+            jwt_secret: env::var("JWT_SECRET_KEY").expect("JWT_SECRET_KEY must be set"),
+            upstream_url: env::var("UPSTREAM_URL").expect("UPSTREAM_URL must be set"),
+            iam_login_url: env::var("IAM_LOGIN_URL").expect("IAM_LOGIN_URL must be set"),
             secure_cookies: !debug,
             excluded_paths,
+            upstream_tls_skip_verify,
         }
     }
 
@@ -72,10 +126,23 @@ fn validate_jwt(token: &str, secret: &str) -> bool {
 }
 
 // ─── Cookie helpers ───────────────────────────────────────────────────────────
-fn build_cookie(name: &str, value: &str, max_age_secs: u64, http_only: bool, secure: bool) -> String {
-    let mut s = format!("{}={}; Max-Age={}; SameSite=Lax; Path=/", name, value, max_age_secs);
-    if http_only { s.push_str("; HttpOnly"); }
-    if secure    { s.push_str("; Secure"); }
+fn build_cookie(
+    name: &str,
+    value: &str,
+    max_age_secs: u64,
+    http_only: bool,
+    secure: bool,
+) -> String {
+    let mut s = format!(
+        "{}={}; Max-Age={}; SameSite=Lax; Path=/",
+        name, value, max_age_secs
+    );
+    if http_only {
+        s.push_str("; HttpOnly");
+    }
+    if secure {
+        s.push_str("; Secure");
+    }
     s
 }
 
@@ -125,7 +192,10 @@ async fn handle_auth(
             .unwrap());
     }
 
-    let cookies = cookie_header.as_deref().map(parse_cookies).unwrap_or_default();
+    let cookies = cookie_header
+        .as_deref()
+        .map(parse_cookies)
+        .unwrap_or_default();
     let intended_path = cookies
         .get("intended_path")
         .cloned()
@@ -134,8 +204,20 @@ async fn handle_auth(
     Ok(Response::builder()
         .status(StatusCode::FOUND)
         .header("Location", intended_path)
-        .header("Set-Cookie", build_cookie("access_token",  &access_token,  86400,  true, config.secure_cookies))
-        .header("Set-Cookie", build_cookie("refresh_token", &refresh_token, 604800, true, config.secure_cookies))
+        .header(
+            "Set-Cookie",
+            build_cookie("access_token", &access_token, 86400, true, config.secure_cookies),
+        )
+        .header(
+            "Set-Cookie",
+            build_cookie(
+                "refresh_token",
+                &refresh_token,
+                604800,
+                true,
+                config.secure_cookies,
+            ),
+        )
         .header("Set-Cookie", clear_cookie("intended_path"))
         .body(Bytes::new())
         .unwrap())
@@ -153,26 +235,53 @@ fn auth_gate(
         return Ok(());
     }
 
-    let cookies = cookie_header.as_deref().map(parse_cookies).unwrap_or_default();
+    let cookies = cookie_header
+        .as_deref()
+        .map(parse_cookies)
+        .unwrap_or_default();
 
     match cookies.get("access_token") {
         None => {
-            info!("No token — redirecting to IAM (intended: {})", original_url);
+            info!(
+                "No token — redirecting to IAM (intended: {})",
+                original_url
+            );
             Err(Response::builder()
                 .status(StatusCode::FOUND)
                 .header("Location", config.iam_login_url.as_str())
-                .header("Set-Cookie", build_cookie("intended_path", original_url, 600, false, config.secure_cookies))
+                .header(
+                    "Set-Cookie",
+                    build_cookie(
+                        "intended_path",
+                        original_url,
+                        600,
+                        false,
+                        config.secure_cookies,
+                    ),
+                )
                 .body(Bytes::new())
                 .unwrap())
         }
         Some(token) if !validate_jwt(token, &config.jwt_secret) => {
-            info!("Invalid/expired token — redirecting to IAM (intended: {})", original_url);
+            info!(
+                "Invalid/expired token — redirecting to IAM (intended: {})",
+                original_url
+            );
             Err(Response::builder()
                 .status(StatusCode::FOUND)
                 .header("Location", config.iam_login_url.as_str())
                 .header("Set-Cookie", clear_cookie("access_token"))
                 .header("Set-Cookie", clear_cookie("refresh_token"))
-                .header("Set-Cookie", build_cookie("intended_path", original_url, 600, false, config.secure_cookies))
+                .header(
+                    "Set-Cookie",
+                    build_cookie(
+                        "intended_path",
+                        original_url,
+                        600,
+                        false,
+                        config.secure_cookies,
+                    ),
+                )
                 .body(Bytes::new())
                 .unwrap())
         }
@@ -198,22 +307,64 @@ fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
     }
 }
 
+// ─── Build hyper client based on TLS config ───────────────────────────────────
+//
+// Returns a boxed async function to keep the proxy_request signature clean.
+// Two variants:
+//   • skip_verify = false (default) — uses native roots, verifies certs normally.
+//     Works for any properly signed upstream (HTTP or HTTPS).
+//   • skip_verify = true            — installs NoVerifier, accepts self-signed /
+//     internal certs (e.g. kubernetes-dashboard's auto-generated cert).
+enum ProxyClient {
+    Verified(Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>),
+    Unverified(Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>),
+}
+
+impl ProxyClient {
+    fn new(skip_verify: bool) -> Self {
+        if skip_verify {
+            let tls = ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
+
+            let https = HttpsConnectorBuilder::new()
+                .with_tls_config(tls)
+                .https_or_http()
+                .enable_http1()
+                .enable_http2()
+                .build();
+
+            Self::Unverified(Client::builder(TokioExecutor::new()).build(https))
+        } else {
+            let https = HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .expect("failed to load native TLS roots")
+                .https_or_http()
+                .enable_http1()
+                .enable_http2()
+                .build();
+
+            Self::Verified(Client::builder(TokioExecutor::new()).build(https))
+        }
+    }
+
+    async fn request(
+        &self,
+        req: Request<Full<Bytes>>,
+    ) -> Result<Response<hyper::body::Incoming>, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Self::Verified(c) => Ok(c.request(req).await?),
+            Self::Unverified(c) => Ok(c.request(req).await?),
+        }
+    }
+}
+
 // ─── Reverse-proxy helper ─────────────────────────────────────────────────────
-//
-// Replaces hyper_reverse_proxy::call(). Steps:
-//  1. Rewrite URI to upstream.
-//  2. Strip hop-by-hop headers from the outbound request.
-//  3. Inject / append X-Forwarded-For.
-//  4. Forward via hyper-util Client (connection-pooled, TokioExecutor).
-//  5. Strip hop-by-hop from the upstream response.
-//  6. Collect the upstream body into Bytes.
-//
-// Collecting into Bytes is appropriate for an auth proxy that doesn't
-// stream large media payloads — and it's the simplest way to satisfy
-// warp's Reply bound (bodyt::Body: From<Bytes>).
 async fn reverse_proxy(
     client_ip: IpAddr,
     upstream_url: &str,
+    tls_skip_verify: bool,
     method: hyper::Method,
     path_and_query: String,
     mut headers: hyper::HeaderMap,
@@ -230,7 +381,7 @@ async fn reverse_proxy(
     // 2. Strip hop-by-hop from outbound headers
     strip_hop_by_hop(&mut headers);
 
-    // 3. X-Forwarded-For: append our client IP to any existing value
+    // 3. X-Forwarded-For
     let xff = headers
         .get("x-forwarded-for")
         .and_then(|v| v.to_str().ok())
@@ -238,35 +389,24 @@ async fn reverse_proxy(
         .unwrap_or_else(|| client_ip.to_string());
     headers.insert("x-forwarded-for", xff.parse()?);
 
-    // 4. Assemble the request.
-    //    The body was already buffered into Bytes by warp::body::bytes(),
-    //    so Full<Bytes> is the correct wrapper — zero extra allocation.
-    //    Full<Bytes>: Body::Data = Bytes, Body::Error = Infallible,
-    //    both satisfy Client's bounds.
+    // 4. Assemble the upstream request
     let mut req_builder = Request::builder().method(method).uri(target_uri);
     *req_builder.headers_mut().unwrap() = headers;
     let req = req_builder.body(Full::new(body))?;
 
-    let client: Client<HttpConnector, Full<Bytes>> =
-        Client::builder(TokioExecutor::new()).build_http();
-
+    // 5. Send via the appropriate client (verified or skip-verify)
+    let client = ProxyClient::new(tls_skip_verify);
     let upstream_resp = client.request(req).await?;
 
-    // 5. Strip hop-by-hop from upstream response headers
+    // 6. Strip hop-by-hop from response, collect body
     let (mut parts, upstream_body) = upstream_resp.into_parts();
     strip_hop_by_hop(&mut parts.headers);
-
-    // 6. Collect the streaming body into Bytes
     let collected = upstream_body.collect().await?.to_bytes();
 
     Ok(Response::from_parts(parts, collected))
 }
 
 // ─── Proxy handler (warp endpoint) ───────────────────────────────────────────
-//
-// warp decomposes each request into individually extracted values.
-// We receive them as flat arguments and re-use them directly — no need
-// to reassemble a full hyper::Request at the warp layer.
 async fn proxy_request(
     client_addr: Option<IpAddr>,
     cookie_header: Option<String>,
@@ -291,7 +431,17 @@ async fn proxy_request(
 
     let ip = client_addr.unwrap_or(IpAddr::from([127, 0, 0, 1]));
 
-    match reverse_proxy(ip, &config.upstream_url, method, path_and_query, headers, body).await {
+    match reverse_proxy(
+        ip,
+        &config.upstream_url,
+        config.upstream_tls_skip_verify,
+        method,
+        path_and_query,
+        headers,
+        body,
+    )
+    .await
+    {
         Ok(response) => Ok(response),
         Err(e) => {
             tracing::warn!("Upstream error: {:?}", e);
@@ -308,7 +458,7 @@ async fn proxy_request(
 async fn main() {
     match dotenvy::dotenv() {
         Ok(path) => eprintln!("Loaded .env from {}", path.display()),
-        Err(_)   => eprintln!("No .env file — using environment variables"),
+        Err(_) => eprintln!("No .env file — using environment variables"),
     }
 
     tracing_subscriber::fmt()
@@ -324,6 +474,7 @@ async fn main() {
         debug = !config.secure_cookies,
         excluded = ?config.excluded_paths,
         upstream = %config.upstream_url,
+        tls_skip_verify = config.upstream_tls_skip_verify,
         "Starting auth-proxy",
     );
 
@@ -351,10 +502,6 @@ async fn main() {
         .and_then(handle_auth);
 
     // ── Route: everything else -> reverse proxy ───────────────────────────────
-    //
-    // warp::body::bytes() eagerly buffers the request body. This replaces
-    // the old manual Request reassembly from parts and also sidesteps the
-    // Request<Incoming>-is-not-Clone problem that blocks warp::ext::get.
     let proxy_route = warp::any()
         .and(warp::addr::remote().map(|addr: Option<std::net::SocketAddr>| {
             addr.map(|a| a.ip())
@@ -363,7 +510,12 @@ async fn main() {
         .and(with_config.clone())
         .and(warp::method())
         .and(warp::path::full())
-        .and(warp::query::raw().map(Some).or(warp::any().map(|| None::<String>)).unify())
+        .and(
+            warp::query::raw()
+                .map(Some)
+                .or(warp::any().map(|| None::<String>))
+                .unify(),
+        )
         .and(warp::header::headers_cloned())
         .and(warp::body::bytes())
         .and_then(proxy_request);
