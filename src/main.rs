@@ -456,6 +456,12 @@ async fn proxy_request(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() {
+    // Install ring as the process-level rustls crypto provider.
+    // Must be called before any TLS operation.
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install ring crypto provider");
+
     match dotenvy::dotenv() {
         Ok(path) => eprintln!("Loaded .env from {}", path.display()),
         Err(_) => eprintln!("No .env file — using environment variables"),
