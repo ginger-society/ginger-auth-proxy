@@ -73,15 +73,13 @@ impl ServerCertVerifier for NoVerifier {
 
 
 
-
 async fn ws_proxy(
     ws: warp::ws::Ws,
     path: warp::path::FullPath,
     query: Option<String>,
     cookie_header: Option<String>,
     config: Config,
-) -> Result<impl Reply, Rejection> {
-    // auth gate — same as HTTP
+) -> Result<Box<dyn warp::Reply>, Rejection> {  // ← Box<dyn Reply>
     let path_str = path.as_str();
     let path_and_query = match query {
         Some(ref q) if !q.is_empty() => format!("{}?{}", path_str, q),
@@ -89,7 +87,7 @@ async fn ws_proxy(
     };
 
     if let Err(redirect) = auth_gate(path_str, &path_and_query, &cookie_header, &config) {
-        return Ok(redirect.into_response());
+        return Ok(Box::new(redirect));  // ← boxed
     }
 
     let upstream = format!(
@@ -101,11 +99,11 @@ async fn ws_proxy(
         path_and_query
     );
 
-    Ok(ws.on_upgrade(move |client_ws| async move {
+    Ok(Box::new(ws.on_upgrade(move |client_ws| async move {  // ← boxed
         if let Err(e) = proxy_websocket(client_ws, upstream).await {
             tracing::warn!("WebSocket proxy error: {:?}", e);
         }
-    }).into_response())
+    })))
 }
 
 async fn proxy_websocket(
@@ -585,7 +583,7 @@ async fn main() {
 
     // ── Route: WebSocket proxy ────────────────────────────────────────────────
     let ws_route = warp::get()
-        .and(warp::ws())
+        .and(warp::ws())  // ← this filter only matches if Upgrade: websocket is present
         .and(warp::path::full())
         .and(
             warp::query::raw()
