@@ -99,6 +99,8 @@ async fn ws_proxy(
         path_and_query
     );
 
+    tracing::info!("WebSocket proxying to: {}", upstream);
+
     Ok(Box::new(ws.on_upgrade(move |client_ws| async move {  // ← boxed
         if let Err(e) = proxy_websocket(client_ws, upstream).await {
             tracing::warn!("WebSocket proxy error: {:?}", e);
