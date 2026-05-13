@@ -17,6 +17,11 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use warp::{Filter, Rejection, Reply};
 
+use warp::ws::WebSocket;
+use futures_util::{SinkExt, StreamExt};
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
+
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -64,6 +69,94 @@ impl ServerCertVerifier for NoVerifier {
             .signature_verification_algorithms
             .supported_schemes()
     }
+}
+
+
+
+
+async fn ws_proxy(
+    ws: warp::ws::Ws,
+    path: warp::path::FullPath,
+    query: Option<String>,
+    cookie_header: Option<String>,
+    config: Config,
+) -> Result<impl Reply, Rejection> {
+    // auth gate — same as HTTP
+    let path_str = path.as_str();
+    let path_and_query = match query {
+        Some(ref q) if !q.is_empty() => format!("{}?{}", path_str, q),
+        _ => path_str.to_string(),
+    };
+
+    if let Err(redirect) = auth_gate(path_str, &path_and_query, &cookie_header, &config) {
+        return Ok(redirect.into_response());
+    }
+
+    let upstream = format!(
+        "{}{}",
+        config.upstream_url
+            .trim_end_matches('/')
+            .replace("http://", "ws://")
+            .replace("https://", "wss://"),
+        path_and_query
+    );
+
+    Ok(ws.on_upgrade(move |client_ws| async move {
+        if let Err(e) = proxy_websocket(client_ws, upstream).await {
+            tracing::warn!("WebSocket proxy error: {:?}", e);
+        }
+    }).into_response())
+}
+
+async fn proxy_websocket(
+    client_ws: WebSocket,
+    upstream_url: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (upstream_ws, _) = connect_async(&upstream_url).await?;
+
+    let (mut client_tx, mut client_rx) = client_ws.split();
+    let (mut upstream_tx, mut upstream_rx) = upstream_ws.split();
+
+    // client → upstream
+    let c2u = tokio::spawn(async move {
+        while let Some(Ok(msg)) = client_rx.next().await {
+            let tung_msg = if msg.is_text() {
+                Message::Text(msg.to_str().unwrap_or("").to_string().into())
+            } else if msg.is_binary() {
+                Message::Binary(msg.as_bytes().to_vec().into())
+            } else if msg.is_ping() {
+                Message::Ping(msg.as_bytes().to_vec().into())
+            } else if msg.is_pong() {
+                Message::Pong(msg.as_bytes().to_vec().into())
+            } else if msg.is_close() {
+                Message::Close(None)
+            } else {
+                continue;
+            };
+            if upstream_tx.send(tung_msg).await.is_err() { break; }
+        }
+    });
+
+    // upstream → client
+    let u2c = tokio::spawn(async move {
+        while let Some(Ok(msg)) = upstream_rx.next().await {
+            let warp_msg = match msg {
+                Message::Text(t) => warp::ws::Message::text(t.to_string()),
+                Message::Binary(b) => warp::ws::Message::binary(b.to_vec()),
+                Message::Ping(p) => warp::ws::Message::ping(p.to_vec()),
+                Message::Pong(p) => warp::ws::Message::pong(p.to_vec()),
+                Message::Close(_) => warp::ws::Message::close(),
+                _ => continue,
+            };
+            if client_tx.send(warp_msg).await.is_err() { break; }
+        }
+    });
+
+    tokio::select! {
+        _ = c2u => {}
+        _ = u2c => {}
+    }
+    Ok(())
 }
 
 // ─── App Config ───────────────────────────────────────────────────────────────
@@ -298,7 +391,6 @@ static HOP_BY_HOP: &[&str] = &[
     "te",
     "trailers",
     "transfer-encoding",
-    "upgrade",
 ];
 
 fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
@@ -490,6 +582,21 @@ async fn main() {
     };
     let cookie_header = warp::header::optional::<String>("cookie");
 
+
+    // ── Route: WebSocket proxy ────────────────────────────────────────────────
+    let ws_route = warp::get()
+        .and(warp::ws())
+        .and(warp::path::full())
+        .and(
+            warp::query::raw()
+                .map(Some)
+                .or(warp::any().map(|| None::<String>))
+                .unify(),
+        )
+        .and(cookie_header.clone())
+        .and(with_config.clone())
+        .and_then(ws_proxy);
+
     // ── Route: logout ─────────────────────────────────────────────────────────
     let logout_route = warp::get()
         .and(warp::path("handle-auth"))
@@ -526,7 +633,7 @@ async fn main() {
         .and(warp::body::bytes())
         .and_then(proxy_request);
 
-    let routes = logout_route.or(auth_route).or(proxy_route);
+    let routes = logout_route.or(ws_route).or(auth_route).or(proxy_route);
 
     let port: u16 = env::var("PORT")
         .ok()
