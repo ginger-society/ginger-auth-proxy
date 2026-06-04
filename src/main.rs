@@ -134,8 +134,7 @@ impl AppState {
                 .with_native_roots()
                 .expect("failed to load native TLS roots")
                 .https_or_http()
-                .enable_http1()
-                .enable_http2()
+                .enable_http1()   // ← http1 only, no enable_http2()
                 .build();
             Client::builder(TokioExecutor::new()).build(https)
         };
@@ -148,8 +147,7 @@ impl AppState {
             let https = HttpsConnectorBuilder::new()
                 .with_tls_config(tls)
                 .https_or_http()
-                .enable_http1()
-                .enable_http2()
+                .enable_http1()   // ← http1 only, no enable_http2()
                 .build();
             Client::builder(TokioExecutor::new()).build(https)
         };
