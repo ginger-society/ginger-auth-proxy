@@ -7,11 +7,12 @@ use axum::{
     body::Body,
     extract::{ConnectInfo, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    response::Response,
     routing::any,
     Router,
 };
 use bytes::Bytes;
+use futures_util::StreamExt;
 use http_body_util::{BodyExt, Full};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -22,8 +23,8 @@ use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::info;
-use futures_util::StreamExt;
 
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
 #[derive(Debug, Serialize, Deserialize)]
@@ -135,7 +136,7 @@ impl AppState {
                 .with_native_roots()
                 .expect("failed to load native TLS roots")
                 .https_or_http()
-                .enable_http1()   // ← http1 only, no enable_http2()
+                .enable_http1()
                 .build();
             Client::builder(TokioExecutor::new()).build(https)
         };
@@ -148,7 +149,7 @@ impl AppState {
             let https = HttpsConnectorBuilder::new()
                 .with_tls_config(tls)
                 .https_or_http()
-                .enable_http1()   // ← http1 only, no enable_http2()
+                .enable_http1()
                 .build();
             Client::builder(TokioExecutor::new()).build(https)
         };
@@ -209,7 +210,6 @@ fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 // ─── Auth gate ────────────────────────────────────────────────────────────────
-// Returns Ok(()) if the request is authenticated, Err(redirect) otherwise.
 fn auth_gate(
     path: &str,
     original_url: &str,
@@ -263,13 +263,26 @@ fn redirect_to_iam(original_url: &str, extra_cookies: Vec<String>, config: &Conf
 }
 
 // ─── Hop-by-hop headers ───────────────────────────────────────────────────────
-static HOP_BY_HOP: &[&str] = &[
+static HOP_BY_HOP_REQ: &[&str] = &[
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding",
+    "te", "trailers", "transfer-encoding", "upgrade",
 ];
 
-fn strip_hop_by_hop(headers: &mut HeaderMap) {
-    for name in HOP_BY_HOP {
+// NOTE: transfer-encoding intentionally NOT stripped from responses
+// so that chunked streaming works correctly end-to-end
+static HOP_BY_HOP_RESP: &[&str] = &[
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers",
+];
+
+fn strip_hop_by_hop_request(headers: &mut HeaderMap) {
+    for name in HOP_BY_HOP_REQ {
+        headers.remove(*name);
+    }
+}
+
+fn strip_hop_by_hop_response(headers: &mut HeaderMap) {
+    for name in HOP_BY_HOP_RESP {
         headers.remove(*name);
     }
 }
@@ -315,34 +328,14 @@ async fn handle_auth(
         .unwrap()
 }
 
-static HOP_BY_HOP_REQ: &[&str] = &[
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade",
-];
-
-static HOP_BY_HOP_RESP: &[&str] = &[
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers",
-    // transfer-encoding intentionally kept so chunked streaming works
-];
-
-fn strip_hop_by_hop_request(headers: &mut HeaderMap) {
-    for name in HOP_BY_HOP_REQ {
-        headers.remove(*name);
-    }
-}
-
-fn strip_hop_by_hop_response(headers: &mut HeaderMap) {
-    for name in HOP_BY_HOP_RESP {
-        headers.remove(*name);
-    }
+fn bad_gateway() -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(Body::from("Bad Gateway"))
+        .unwrap()
 }
 
 // ─── Route: streaming reverse proxy ──────────────────────────────────────────
-use axum::extract::ws::{WebSocket, WebSocketUpgrade, Message as AxumMsg};
-use tokio_tungstenite::tungstenite::Message as TungMsg;
-use futures_util::{SinkExt};
-
 async fn proxy_request(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
@@ -360,17 +353,7 @@ async fn proxy_request(
         return redirect;
     }
 
-
-    // ── Regular HTTP proxy ────────────────────────────────────────────────────
     info!("Proxying {} {}", parts.method, path_and_query);
-
-    let path_and_query = if path_and_query.contains("watch=true")
-        && !path_and_query.contains("timeoutSeconds")
-    {
-        format!("{}&timeoutSeconds=300", path_and_query)
-    } else {
-        path_and_query
-    };
 
     let target_uri = format!(
         "{}{}",
@@ -386,6 +369,7 @@ async fn proxy_request(
         }
     };
 
+    // Collect request body — requests are typically small (not streaming)
     let body_bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => {
@@ -394,11 +378,12 @@ async fn proxy_request(
         }
     };
 
+    // Build upstream request headers
     let mut upstream_headers = parts.headers.clone();
     strip_hop_by_hop_request(&mut upstream_headers);
-
     upstream_headers.insert("connection", HeaderValue::from_static("keep-alive"));
 
+    // X-Forwarded-For
     let client_ip = addr.ip();
     let xff = upstream_headers
         .get("x-forwarded-for")
@@ -409,11 +394,11 @@ async fn proxy_request(
         upstream_headers.insert("x-forwarded-for", val);
     }
 
+    // Host
     if let Some(host) = target_uri.host() {
-        let host_val = if let Some(port) = target_uri.port() {
-            format!("{}:{}", host, port)
-        } else {
-            host.to_string()
+        let host_val = match target_uri.port() {
+            Some(port) => format!("{}:{}", host, port),
+            None       => host.to_string(),
         };
         if let Ok(val) = HeaderValue::from_str(&host_val) {
             upstream_headers.insert("host", val);
@@ -453,102 +438,57 @@ async fn proxy_request(
     let (mut resp_parts, resp_body) = upstream_resp.into_parts();
     strip_hop_by_hop_response(&mut resp_parts.headers);
 
+    // Tell nginx not to buffer
     resp_parts.headers.insert(
         "x-accel-buffering",
         HeaderValue::from_static("no"),
     );
 
+    // ── Stream body via channel with capacity 1 ───────────────────────────────
+    // Channel capacity 1 forces each chunk to be delivered immediately before
+    // the next is read — prevents any internal buffering of streaming responses.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     let path_for_log = path_and_query.clone();
     let is_watch = path_and_query.contains("watch=true");
-    let stream = resp_body.into_data_stream();
-    let logged_stream = stream.map(move |chunk| {
-        match &chunk {
-            Ok(b) => {
-                if is_watch {
-                    tracing::info!(path = %path_for_log, bytes = b.len(), "watch chunk");
-                } else {
-                    tracing::debug!(path = %path_for_log, bytes = b.len(), "chunk");
+
+    tokio::spawn(async move {
+        let mut stream = resp_body.into_data_stream();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(bytes) => {
+                    if is_watch {
+                        tracing::info!(
+                            path  = %path_for_log,
+                            bytes = bytes.len(),
+                            "watch chunk"
+                        );
+                    } else {
+                        tracing::debug!(
+                            path  = %path_for_log,
+                            bytes = bytes.len(),
+                            "chunk"
+                        );
+                    }
+                    if tx.send(Ok(bytes)).await.is_err() {
+                        tracing::debug!(path = %path_for_log, "client disconnected");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(path = %path_for_log, "stream error: {e}");
+                    let _ = tx.send(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))).await;
+                    break;
                 }
             }
-            Err(e) => tracing::warn!(path = %path_for_log, "stream error: {e}"),
         }
-        chunk
+        tracing::debug!(path = %path_for_log, "stream ended");
     });
 
-    let axum_body = Body::from_stream(logged_stream);
+    let axum_body = Body::from_stream(ReceiverStream::new(rx));
     Response::from_parts(resp_parts, axum_body)
-}
-
-async fn proxy_websocket(
-    client_ws: WebSocket,
-    upstream_url: String,
-    original_headers: HeaderMap,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-
-    // Build upstream request — let tungstenite generate its own WS handshake headers,
-    // only forward cookie and authorization from the original request
-    let mut handshake = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(upstream_url.parse::<tokio_tungstenite::tungstenite::http::Uri>()?);
-
-    if let Some(cookie) = original_headers.get("cookie") {
-        handshake = handshake.header("cookie", cookie.as_bytes());
-    }
-    if let Some(auth) = original_headers.get("authorization") {
-        handshake = handshake.header("authorization", auth.as_bytes());
-    }
-
-    let handshake_req = handshake.body(())?;
-
-    let (upstream_ws, resp) = tokio_tungstenite::connect_async(handshake_req).await?;
-    tracing::info!("WebSocket upstream connected status={}", resp.status());
-
-    let (mut client_tx, mut client_rx) = client_ws.split();
-    let (mut up_tx, mut up_rx) = upstream_ws.split();
-
-    let c2u = tokio::spawn(async move {
-        while let Some(Ok(msg)) = client_rx.next().await {
-            let tung = match msg {
-                AxumMsg::Text(t)   => TungMsg::Text(t.to_string().into()),
-                AxumMsg::Binary(b) => TungMsg::Binary(b.to_vec().into()),
-                AxumMsg::Ping(p)   => TungMsg::Ping(p.to_vec().into()),
-                AxumMsg::Pong(p)   => TungMsg::Pong(p.to_vec().into()),
-                AxumMsg::Close(_)  => {
-                    let _ = up_tx.send(TungMsg::Close(None)).await;
-                    break;
-                }
-            };
-            if up_tx.send(tung).await.is_err() { break; }
-        }
-        tracing::debug!("c2u done");
-    });
-
-    let u2c = tokio::spawn(async move {
-        while let Some(Ok(msg)) = up_rx.next().await {
-            let axum_msg = match msg {
-                TungMsg::Text(t)   => AxumMsg::Text(t.to_string().into()),
-                TungMsg::Binary(b) => AxumMsg::Binary(b.to_vec().into()),
-                TungMsg::Ping(_)   => continue,
-                TungMsg::Pong(p)   => AxumMsg::Pong(p.to_vec().into()),
-                TungMsg::Close(_)  => {
-                    let _ = client_tx.send(AxumMsg::Close(None)).await;
-                    break;
-                }
-                _ => continue,
-            };
-            if client_tx.send(axum_msg).await.is_err() { break; }
-        }
-        tracing::debug!("u2c done");
-    });
-
-    tokio::join!(c2u, u2c);
-    Ok(())
-}
-
-fn bad_gateway() -> Response {
-    Response::builder()
-        .status(StatusCode::BAD_GATEWAY)
-        .body(Body::from("Bad Gateway"))
-        .unwrap()
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -566,7 +506,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "ginger_auth_proxy=info,tower_http=info".into()),
+                .unwrap_or_else(|_| "ginger_auth_proxy=debug".into()),
         )
         .init();
 
@@ -583,11 +523,8 @@ async fn main() {
     let state = AppState::new(config);
 
     let app = Router::new()
-        // ── Logout ────────────────────────────────────────────────────────────
         .route("/handle-auth/logout", any(handle_logout))
-        // ── Auth callback ─────────────────────────────────────────────────────
         .route("/handle-auth/:access_token/:refresh_token", any(handle_auth))
-        // ── Everything else → streaming proxy ─────────────────────────────────
         .fallback(any(proxy_request))
         .with_state(state)
         .into_make_service_with_connect_info::<std::net::SocketAddr>();

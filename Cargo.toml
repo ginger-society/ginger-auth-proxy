@@ -18,6 +18,7 @@ rustls         = { version = "0.23", default-features = false, features = ["ring
 
 # ── Async runtime ─────────────────────────────────────────────────────────────
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 
 # ── Web framework ─────────────────────────────────────────────────────────────
 axum = { version = "0.7", features = ["http1", "http2", "macros", "ws"] }
