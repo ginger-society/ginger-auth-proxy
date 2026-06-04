@@ -315,6 +315,29 @@ async fn handle_auth(
         .unwrap()
 }
 
+static HOP_BY_HOP_REQ: &[&str] = &[
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade",
+];
+
+static HOP_BY_HOP_RESP: &[&str] = &[
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers",
+    // transfer-encoding intentionally kept so chunked streaming works
+];
+
+fn strip_hop_by_hop_request(headers: &mut HeaderMap) {
+    for name in HOP_BY_HOP_REQ {
+        headers.remove(*name);
+    }
+}
+
+fn strip_hop_by_hop_response(headers: &mut HeaderMap) {
+    for name in HOP_BY_HOP_RESP {
+        headers.remove(*name);
+    }
+}
+
 // ─── Route: streaming reverse proxy ──────────────────────────────────────────
 async fn proxy_request(
     State(state): State<AppState>,
@@ -323,13 +346,22 @@ async fn proxy_request(
 ) -> Response {
     let (parts, body) = req.into_parts();
 
-    let path = parts.uri.path();
-    let path_and_query = parts.uri
+    let path = parts.uri.path().to_string();
+    let path_and_query_raw = parts.uri
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
-        .unwrap_or_else(|| path.to_string());
+        .unwrap_or_else(|| path.clone());
 
-    if let Err(redirect) = auth_gate(path, &path_and_query, &parts.headers, &state.config) {
+    // ── Rewrite watch URLs to add a long timeout so K8s keeps the stream open ─
+    let path_and_query = if path_and_query_raw.contains("watch=true")
+        && !path_and_query_raw.contains("timeoutSeconds")
+    {
+        format!("{}&timeoutSeconds=300", path_and_query_raw)
+    } else {
+        path_and_query_raw.clone()
+    };
+
+    if let Err(redirect) = auth_gate(&path, &path_and_query, &parts.headers, &state.config) {
         return redirect;
     }
 
@@ -358,7 +390,14 @@ async fn proxy_request(
     };
 
     let mut upstream_headers = parts.headers.clone();
-    strip_hop_by_hop(&mut upstream_headers);
+    strip_hop_by_hop_request(&mut upstream_headers);
+
+    // Keep connection alive to upstream
+    if let Ok(val) = HeaderValue::from_static("keep-alive").to_str() {
+        if let Ok(v) = HeaderValue::from_str(val) {
+            upstream_headers.insert("connection", v);
+        }
+    }
 
     let client_ip = addr.ip();
     let xff = upstream_headers
@@ -402,7 +441,6 @@ async fn proxy_request(
         }
     };
 
-    // ── Log what upstream returned ────────────────────────────────────────────
     tracing::info!(
         status         = %upstream_resp.status(),
         content_type   = ?upstream_resp.headers().get("content-type"),
@@ -413,16 +451,38 @@ async fn proxy_request(
     );
 
     let (mut resp_parts, resp_body) = upstream_resp.into_parts();
-    strip_hop_by_hop(&mut resp_parts.headers);
+    strip_hop_by_hop_response(&mut resp_parts.headers);
 
-    // ── Wrap stream with logging so we can see when/why it drops ─────────────
+    // Tell nginx not to buffer this response
+    resp_parts.headers.insert(
+        "x-accel-buffering",
+        HeaderValue::from_static("no"),
+    );
+
+    // ── Stream body with logging ──────────────────────────────────────────────
+    let is_watch = path_and_query.contains("watch=true");
     let path_for_log = path_and_query.clone();
+
     let stream = resp_body.into_data_stream();
     let logged_stream = {
         use futures_util::StreamExt;
         stream.map(move |chunk| {
             match &chunk {
-                Ok(b)  => tracing::debug!(path = %path_for_log, bytes = b.len(), "stream chunk"),
+                Ok(b) => {
+                    if is_watch {
+                        tracing::info!(
+                            path  = %path_for_log,
+                            bytes = b.len(),
+                            "watch stream chunk"
+                        );
+                    } else {
+                        tracing::debug!(
+                            path  = %path_for_log,
+                            bytes = b.len(),
+                            "stream chunk"
+                        );
+                    }
+                }
                 Err(e) => tracing::warn!(path = %path_for_log, "stream error: {e}"),
             }
             chunk
@@ -432,12 +492,6 @@ async fn proxy_request(
     let axum_body = Body::from_stream(logged_stream);
 
     let mut response = Response::from_parts(resp_parts, axum_body);
-
-    // Tell nginx not to buffer this response
-    response.headers_mut().insert(
-        "x-accel-buffering",
-        HeaderValue::from_static("no"),
-    );
 
     tracing::info!(
         status  = %response.status(),
