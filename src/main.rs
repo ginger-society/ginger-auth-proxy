@@ -374,8 +374,10 @@ async fn proxy_request(
 
         tracing::info!("WebSocket upgrade → {}", upstream_url);
 
+        let headers = parts.headers.clone();  // ← capture headers
+
         return upgrade.on_upgrade(move |client_ws| async move {
-            if let Err(e) = proxy_websocket(client_ws, upstream_url).await {
+            if let Err(e) = proxy_websocket(client_ws, upstream_url, headers).await {  // ← pass headers
                 tracing::warn!("WebSocket proxy error: {e}");
             }
         });
@@ -502,9 +504,35 @@ async fn proxy_request(
 async fn proxy_websocket(
     client_ws: WebSocket,
     upstream_url: String,
+    original_headers: HeaderMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (upstream_ws, _) = tokio_tungstenite::connect_async(&upstream_url).await?;
-    tracing::info!("WebSocket upstream connected: {}", upstream_url);
+    // Build a proper handshake request with original headers
+    let uri: tokio_tungstenite::tungstenite::http::Uri = upstream_url.parse()?;
+
+    let mut handshake = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(uri);
+
+    // Forward relevant headers from the original browser request
+    for (name, value) in &original_headers {
+        let n = name.as_str().to_lowercase();
+        // Skip hop-by-hop and WebSocket handshake headers — tungstenite sets those
+        if matches!(n.as_str(),
+            "connection" | "upgrade" | "sec-websocket-key" |
+            "sec-websocket-version" | "sec-websocket-extensions" |
+            "sec-websocket-protocol" | "host" | "transfer-encoding"
+        ) {
+            continue;
+        }
+        if let Ok(v) = tokio_tungstenite::tungstenite::http::HeaderValue::from_bytes(value.as_bytes()) {
+            handshake = handshake.header(name.as_str(), v);
+        }
+    }
+
+    let handshake_req = handshake.body(())?;
+
+    let (upstream_ws, resp) = tokio_tungstenite::connect_async(handshake_req).await?;
+    tracing::info!("WebSocket upstream connected: {} status={}", upstream_url, resp.status());
+
 
     let (mut client_tx, mut client_rx) = client_ws.split();
     let (mut up_tx, mut up_rx) = upstream_ws.split();
