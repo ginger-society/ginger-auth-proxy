@@ -17,11 +17,6 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 use warp::{Filter, Rejection, Reply};
 
-use warp::ws::WebSocket;
-use futures_util::{SinkExt, StreamExt};
-use tokio_tungstenite::connect_async;
-use tokio_tungstenite::tungstenite::Message;
-
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
 #[derive(Debug, Serialize, Deserialize)]
 struct Claims {
@@ -30,7 +25,7 @@ struct Claims {
     extra: HashMap<String, serde_json::Value>,
 }
 
-// ─── TLS: no-op verifier for self-signed / internal certs ────────────────────
+// ─── TLS: no-op verifier ──────────────────────────────────────────────────────
 #[derive(Debug)]
 struct NoVerifier;
 
@@ -45,7 +40,6 @@ impl ServerCertVerifier for NoVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         Ok(ServerCertVerified::assertion())
     }
-
     fn verify_tls12_signature(
         &self,
         _message: &[u8],
@@ -54,7 +48,6 @@ impl ServerCertVerifier for NoVerifier {
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
-
     fn verify_tls13_signature(
         &self,
         _message: &[u8],
@@ -63,117 +56,11 @@ impl ServerCertVerifier for NoVerifier {
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
-
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
             .supported_schemes()
     }
-}
-
-
-
-async fn ws_proxy(
-    ws: warp::ws::Ws,
-    path: warp::path::FullPath,
-    query: Option<String>,
-    cookie_header: Option<String>,
-    config: Config,
-) -> Result<Box<dyn warp::Reply>, Rejection> {  // ← Box<dyn Reply>
-    let path_str = path.as_str();
-    let path_and_query = match query {
-        Some(ref q) if !q.is_empty() => format!("{}?{}", path_str, q),
-        _ => path_str.to_string(),
-    };
-
-    if let Err(redirect) = auth_gate(path_str, &path_and_query, &cookie_header, &config) {
-        return Ok(Box::new(redirect));  // ← boxed
-    }
-
-    let upstream = format!(
-        "{}{}",
-        config.upstream_url
-            .trim_end_matches('/')
-            .replace("http://", "ws://")
-            .replace("https://", "wss://"),
-        path_and_query
-    );
-
-    tracing::info!("WebSocket proxying to: {}", upstream);
-
-    Ok(Box::new(ws.on_upgrade(move |client_ws| async move {  // ← boxed
-        if let Err(e) = proxy_websocket(client_ws, upstream).await {
-            tracing::warn!("WebSocket proxy error: {:?}", e);
-        }
-    })))
-}
-
-async fn proxy_websocket(
-    client_ws: WebSocket,
-    upstream_url: String,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (upstream_ws, _) = connect_async(&upstream_url).await?;
-
-    let (mut client_tx, mut client_rx) = client_ws.split();
-    let (mut up_tx, mut up_rx) = upstream_ws.split();
-
-    // client → upstream: forward raw bytes, don't interpret
-    let c2u = tokio::spawn(async move {
-        while let Some(Ok(msg)) = client_rx.next().await {
-            // Skip warp's auto-generated pong frames (warp sends these itself)
-            if msg.is_pong() {
-                continue;
-            }
-            if msg.is_close() {
-                let _ = up_tx.send(Message::Close(None)).await;
-                break;
-            }
-
-            // Convert warp → tungstenite preserving raw bytes
-            let tung = if msg.is_text() {
-                match std::str::from_utf8(msg.as_bytes()) {
-                    Ok(s) => Message::Text(s.to_string().into()),
-                    Err(_) => Message::Binary(msg.as_bytes().to_vec().into()),
-                }
-            } else if msg.is_binary() {
-                Message::Binary(msg.as_bytes().to_vec().into())
-            } else if msg.is_ping() {
-                // Don't forward — warp already replied; just echo as pong to upstream
-                Message::Pong(msg.as_bytes().to_vec().into())
-            } else {
-                continue;
-            };
-
-            if up_tx.send(tung).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // upstream → client: forward raw bytes, don't interpret
-    let u2c = tokio::spawn(async move {
-        while let Some(Ok(msg)) = up_rx.next().await {
-            let warp_msg = match msg {
-                // tungstenite auto-replies to Ping with Pong — just forward the Pong to client
-                Message::Ping(_) => continue,  // tungstenite handled it
-                Message::Pong(p) => warp::ws::Message::pong(p.to_vec()),
-                Message::Text(t) => warp::ws::Message::text(t.to_string()),
-                Message::Binary(b) => warp::ws::Message::binary(b.to_vec()),
-                Message::Close(_) => {
-                    let _ = client_tx.send(warp::ws::Message::close()).await;
-                    break;
-                }
-                _ => continue,
-            };
-
-            if client_tx.send(warp_msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    tokio::join!(c2u, u2c);
-    Ok(())
 }
 
 // ─── App Config ───────────────────────────────────────────────────────────────
@@ -182,14 +69,8 @@ struct Config {
     jwt_secret: String,
     upstream_url: String,
     iam_login_url: String,
-    /// DEBUG=true  -> no Secure cookie flag, verbose logs  (local dev)
-    /// DEBUG=false -> Secure cookie flag on                (default / prod)
     secure_cookies: bool,
-    /// Path prefixes that bypass the auth gate entirely.
-    /// Set via EXCLUDED_PATHS=/health,/metrics,/public
     excluded_paths: Vec<String>,
-    /// UPSTREAM_TLS_SKIP_VERIFY=true  -> skip TLS cert verification (self-signed / internal certs)
-    /// UPSTREAM_TLS_SKIP_VERIFY=false -> verify TLS cert normally   (default)
     upstream_tls_skip_verify: bool,
 }
 
@@ -201,7 +82,7 @@ impl Config {
 
         let upstream_tls_skip_verify = env::var("UPSTREAM_TLS_SKIP_VERIFY")
             .map(|v| matches!(v.to_lowercase().as_str(), "true" | "1"))
-            .unwrap_or(false); // default: verify certs (safe for prod)
+            .unwrap_or(false);
 
         let excluded_paths = env::var("EXCLUDED_PATHS")
             .unwrap_or_default()
@@ -212,9 +93,9 @@ impl Config {
             .collect();
 
         Config {
-            jwt_secret: env::var("JWT_SECRET_KEY").expect("JWT_SECRET_KEY must be set"),
-            upstream_url: env::var("UPSTREAM_URL").expect("UPSTREAM_URL must be set"),
-            iam_login_url: env::var("IAM_LOGIN_URL").expect("IAM_LOGIN_URL must be set"),
+            jwt_secret:     env::var("JWT_SECRET_KEY").expect("JWT_SECRET_KEY must be set"),
+            upstream_url:   env::var("UPSTREAM_URL").expect("UPSTREAM_URL must be set"),
+            iam_login_url:  env::var("IAM_LOGIN_URL").expect("IAM_LOGIN_URL must be set"),
             secure_cookies: !debug,
             excluded_paths,
             upstream_tls_skip_verify,
@@ -228,7 +109,7 @@ impl Config {
     }
 }
 
-// ─── JWT Validator ────────────────────────────────────────────────────────────
+// ─── JWT ──────────────────────────────────────────────────────────────────────
 fn validate_jwt(token: &str, secret: &str) -> bool {
     let mut v = Validation::new(Algorithm::HS256);
     v.validate_exp = true;
@@ -236,23 +117,10 @@ fn validate_jwt(token: &str, secret: &str) -> bool {
 }
 
 // ─── Cookie helpers ───────────────────────────────────────────────────────────
-fn build_cookie(
-    name: &str,
-    value: &str,
-    max_age_secs: u64,
-    http_only: bool,
-    secure: bool,
-) -> String {
-    let mut s = format!(
-        "{}={}; Max-Age={}; SameSite=Lax; Path=/",
-        name, value, max_age_secs
-    );
-    if http_only {
-        s.push_str("; HttpOnly");
-    }
-    if secure {
-        s.push_str("; Secure");
-    }
+fn build_cookie(name: &str, value: &str, max_age_secs: u64, http_only: bool, secure: bool) -> String {
+    let mut s = format!("{}={}; Max-Age={}; SameSite=Lax; Path=/", name, value, max_age_secs);
+    if http_only { s.push_str("; HttpOnly"); }
+    if secure    { s.push_str("; Secure"); }
     s
 }
 
@@ -273,7 +141,158 @@ fn parse_cookies(header: &str) -> HashMap<String, String> {
         .collect()
 }
 
-// ─── Route: GET /handle-auth/logout ──────────────────────────────────────────
+// ─── Auth gate ────────────────────────────────────────────────────────────────
+fn auth_gate(
+    path: &str,
+    original_url: &str,
+    cookie_header: &Option<String>,
+    config: &Config,
+) -> Result<(), Response<Bytes>> {
+    if config.is_excluded(path) {
+        info!("Auth skipped (excluded path): {}", path);
+        return Ok(());
+    }
+
+    let cookies = cookie_header.as_deref().map(parse_cookies).unwrap_or_default();
+
+    match cookies.get("access_token") {
+        None => {
+            info!("No token — redirecting to IAM (intended: {})", original_url);
+            Err(Response::builder()
+                .status(StatusCode::FOUND)
+                .header("Location", config.iam_login_url.as_str())
+                .header("Set-Cookie", build_cookie("intended_path", original_url, 600, false, config.secure_cookies))
+                .body(Bytes::new())
+                .unwrap())
+        }
+        Some(token) if !validate_jwt(token, &config.jwt_secret) => {
+            info!("Invalid/expired token — redirecting to IAM (intended: {})", original_url);
+            Err(Response::builder()
+                .status(StatusCode::FOUND)
+                .header("Location", config.iam_login_url.as_str())
+                .header("Set-Cookie", clear_cookie("access_token"))
+                .header("Set-Cookie", clear_cookie("refresh_token"))
+                .header("Set-Cookie", build_cookie("intended_path", original_url, 600, false, config.secure_cookies))
+                .body(Bytes::new())
+                .unwrap())
+        }
+        _ => Ok(()),
+    }
+}
+
+// ─── Hop-by-hop headers ───────────────────────────────────────────────────────
+static HOP_BY_HOP: &[&str] = &[
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding",
+];
+
+fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
+    for name in HOP_BY_HOP {
+        headers.remove(*name);
+    }
+}
+
+// ─── Hyper client ─────────────────────────────────────────────────────────────
+enum ProxyClient {
+    Verified(Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>),
+    Unverified(Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>),
+}
+
+impl ProxyClient {
+    fn new(skip_verify: bool) -> Self {
+        if skip_verify {
+            let tls = ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
+            let https = HttpsConnectorBuilder::new()
+                .with_tls_config(tls)
+                .https_or_http()
+                .enable_http1()
+                .enable_http2()
+                .build();
+            Self::Unverified(Client::builder(TokioExecutor::new()).build(https))
+        } else {
+            let https = HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .expect("failed to load native TLS roots")
+                .https_or_http()
+                .enable_http1()
+                .enable_http2()
+                .build();
+            Self::Verified(Client::builder(TokioExecutor::new()).build(https))
+        }
+    }
+
+    async fn request(
+        &self,
+        req: Request<Full<Bytes>>,
+    ) -> Result<Response<hyper::body::Incoming>, Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Self::Verified(c)   => Ok(c.request(req).await?),
+            Self::Unverified(c) => Ok(c.request(req).await?),
+        }
+    }
+}
+
+// ─── Streaming reverse proxy ──────────────────────────────────────────────────
+// Returns Response<Bytes> — warp requires a concrete body type it knows about.
+// For watch/SSE streams this means the response is fully buffered before
+// being sent to the client. This is a warp limitation; to get true streaming
+// you would need to switch to axum or raw hyper.
+async fn reverse_proxy(
+    client_ip: IpAddr,
+    upstream_url: &str,
+    tls_skip_verify: bool,
+    method: hyper::Method,
+    path_and_query: String,
+    mut headers: hyper::HeaderMap,
+    body: Bytes,
+) -> Result<Response<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
+    let target_uri: hyper::Uri = format!(
+        "{}{}",
+        upstream_url.trim_end_matches('/'),
+        path_and_query
+    ).parse()?;
+
+    strip_hop_by_hop(&mut headers);
+
+    let xff = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|existing| format!("{}, {}", existing, client_ip))
+        .unwrap_or_else(|| client_ip.to_string());
+    headers.insert("x-forwarded-for", xff.parse()?);
+
+    // Forward Host header to upstream
+    if let Ok(host) = upstream_url
+        .trim_start_matches("http://")
+        .trim_start_matches("https://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .parse::<hyper::header::HeaderValue>()
+    {
+        headers.insert(hyper::header::HOST, host);
+    }
+
+    let mut req_builder = Request::builder().method(method).uri(target_uri);
+    *req_builder.headers_mut().unwrap() = headers;
+    let req = req_builder.body(Full::new(body))?;
+
+    let client = ProxyClient::new(tls_skip_verify);
+    let upstream_resp = client.request(req).await?;
+
+    let (mut parts, body) = upstream_resp.into_parts();
+    strip_hop_by_hop(&mut parts.headers);
+
+    // Collect the full body — required by warp's Reply bound
+    let collected = body.collect().await?.to_bytes();
+
+    Ok(Response::from_parts(parts, collected))
+}
+
+// ─── Route: logout ────────────────────────────────────────────────────────────
 async fn handle_logout() -> Result<impl Reply, Rejection> {
     Ok(Response::builder()
         .status(StatusCode::FOUND)
@@ -285,7 +304,7 @@ async fn handle_logout() -> Result<impl Reply, Rejection> {
         .unwrap())
 }
 
-// ─── Route: GET /handle-auth/:accessToken/:refreshToken ──────────────────────
+// ─── Route: handle-auth/:accessToken/:refreshToken ───────────────────────────
 async fn handle_auth(
     access_token: String,
     refresh_token: String,
@@ -302,10 +321,7 @@ async fn handle_auth(
             .unwrap());
     }
 
-    let cookies = cookie_header
-        .as_deref()
-        .map(parse_cookies)
-        .unwrap_or_default();
+    let cookies = cookie_header.as_deref().map(parse_cookies).unwrap_or_default();
     let intended_path = cookies
         .get("intended_path")
         .cloned()
@@ -314,208 +330,14 @@ async fn handle_auth(
     Ok(Response::builder()
         .status(StatusCode::FOUND)
         .header("Location", intended_path)
-        .header(
-            "Set-Cookie",
-            build_cookie("access_token", &access_token, 86400, true, config.secure_cookies),
-        )
-        .header(
-            "Set-Cookie",
-            build_cookie(
-                "refresh_token",
-                &refresh_token,
-                604800,
-                true,
-                config.secure_cookies,
-            ),
-        )
+        .header("Set-Cookie", build_cookie("access_token",  &access_token,  86400,  true, config.secure_cookies))
+        .header("Set-Cookie", build_cookie("refresh_token", &refresh_token, 604800, true, config.secure_cookies))
         .header("Set-Cookie", clear_cookie("intended_path"))
         .body(Bytes::new())
         .unwrap())
 }
 
-// ─── Auth gate ────────────────────────────────────────────────────────────────
-fn auth_gate(
-    path: &str,
-    original_url: &str,
-    cookie_header: &Option<String>,
-    config: &Config,
-) -> Result<(), Response<Bytes>> {
-    if config.is_excluded(path) {
-        info!("Auth skipped (excluded path): {}", path);
-        return Ok(());
-    }
-
-    let cookies = cookie_header
-        .as_deref()
-        .map(parse_cookies)
-        .unwrap_or_default();
-
-    match cookies.get("access_token") {
-        None => {
-            info!(
-                "No token — redirecting to IAM (intended: {})",
-                original_url
-            );
-            Err(Response::builder()
-                .status(StatusCode::FOUND)
-                .header("Location", config.iam_login_url.as_str())
-                .header(
-                    "Set-Cookie",
-                    build_cookie(
-                        "intended_path",
-                        original_url,
-                        600,
-                        false,
-                        config.secure_cookies,
-                    ),
-                )
-                .body(Bytes::new())
-                .unwrap())
-        }
-        Some(token) if !validate_jwt(token, &config.jwt_secret) => {
-            info!(
-                "Invalid/expired token — redirecting to IAM (intended: {})",
-                original_url
-            );
-            Err(Response::builder()
-                .status(StatusCode::FOUND)
-                .header("Location", config.iam_login_url.as_str())
-                .header("Set-Cookie", clear_cookie("access_token"))
-                .header("Set-Cookie", clear_cookie("refresh_token"))
-                .header(
-                    "Set-Cookie",
-                    build_cookie(
-                        "intended_path",
-                        original_url,
-                        600,
-                        false,
-                        config.secure_cookies,
-                    ),
-                )
-                .body(Bytes::new())
-                .unwrap())
-        }
-        _ => Ok(()),
-    }
-}
-
-// ─── Hop-by-hop headers (RFC 7230 §6.1) ──────────────────────────────────────
-static HOP_BY_HOP: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailers",
-    "transfer-encoding",
-];
-
-fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
-    for name in HOP_BY_HOP {
-        headers.remove(*name);
-    }
-}
-
-// ─── Build hyper client based on TLS config ───────────────────────────────────
-//
-// Returns a boxed async function to keep the proxy_request signature clean.
-// Two variants:
-//   • skip_verify = false (default) — uses native roots, verifies certs normally.
-//     Works for any properly signed upstream (HTTP or HTTPS).
-//   • skip_verify = true            — installs NoVerifier, accepts self-signed /
-//     internal certs (e.g. kubernetes-dashboard's auto-generated cert).
-enum ProxyClient {
-    Verified(Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>),
-    Unverified(Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>),
-}
-
-impl ProxyClient {
-    fn new(skip_verify: bool) -> Self {
-        if skip_verify {
-            let tls = ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                .with_no_client_auth();
-
-            let https = HttpsConnectorBuilder::new()
-                .with_tls_config(tls)
-                .https_or_http()
-                .enable_http1()
-                .enable_http2()
-                .build();
-
-            Self::Unverified(Client::builder(TokioExecutor::new()).build(https))
-        } else {
-            let https = HttpsConnectorBuilder::new()
-                .with_native_roots()
-                .expect("failed to load native TLS roots")
-                .https_or_http()
-                .enable_http1()
-                .enable_http2()
-                .build();
-
-            Self::Verified(Client::builder(TokioExecutor::new()).build(https))
-        }
-    }
-
-    async fn request(
-        &self,
-        req: Request<Full<Bytes>>,
-    ) -> Result<Response<hyper::body::Incoming>, Box<dyn std::error::Error + Send + Sync>> {
-        match self {
-            Self::Verified(c) => Ok(c.request(req).await?),
-            Self::Unverified(c) => Ok(c.request(req).await?),
-        }
-    }
-}
-
-// ─── Reverse-proxy helper ─────────────────────────────────────────────────────
-async fn reverse_proxy(
-    client_ip: IpAddr,
-    upstream_url: &str,
-    tls_skip_verify: bool,
-    method: hyper::Method,
-    path_and_query: String,
-    mut headers: hyper::HeaderMap,
-    body: Bytes,
-) -> Result<Response<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
-    // 1. Build the upstream URI
-    let target_uri: hyper::Uri = format!(
-        "{}{}",
-        upstream_url.trim_end_matches('/'),
-        path_and_query
-    )
-    .parse()?;
-
-    // 2. Strip hop-by-hop from outbound headers
-    strip_hop_by_hop(&mut headers);
-
-    // 3. X-Forwarded-For
-    let xff = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|existing| format!("{}, {}", existing, client_ip))
-        .unwrap_or_else(|| client_ip.to_string());
-    headers.insert("x-forwarded-for", xff.parse()?);
-
-    // 4. Assemble the upstream request
-    let mut req_builder = Request::builder().method(method).uri(target_uri);
-    *req_builder.headers_mut().unwrap() = headers;
-    let req = req_builder.body(Full::new(body))?;
-
-    // 5. Send via the appropriate client (verified or skip-verify)
-    let client = ProxyClient::new(tls_skip_verify);
-    let upstream_resp = client.request(req).await?;
-
-    // 6. Strip hop-by-hop from response, collect body
-    let (mut parts, upstream_body) = upstream_resp.into_parts();
-    strip_hop_by_hop(&mut parts.headers);
-    let collected = upstream_body.collect().await?.to_bytes();
-
-    Ok(Response::from_parts(parts, collected))
-}
-
-// ─── Proxy handler (warp endpoint) ───────────────────────────────────────────
+// ─── Route: proxy ─────────────────────────────────────────────────────────────
 async fn proxy_request(
     client_addr: Option<IpAddr>,
     cookie_header: Option<String>,
@@ -527,8 +349,8 @@ async fn proxy_request(
     body: Bytes,
 ) -> Result<impl Reply, Rejection> {
     let path_str = path.as_str();
-    let path_and_query = match query {
-        Some(ref q) if !q.is_empty() => format!("{}?{}", path_str, q),
+    let path_and_query = match &query {
+        Some(q) if !q.is_empty() => format!("{}?{}", path_str, q),
         _ => path_str.to_string(),
     };
 
@@ -548,9 +370,7 @@ async fn proxy_request(
         path_and_query,
         headers,
         body,
-    )
-    .await
-    {
+    ).await {
         Ok(response) => Ok(response),
         Err(e) => {
             tracing::warn!("Upstream error: {:?}", e);
@@ -565,15 +385,13 @@ async fn proxy_request(
 // ─── Main ─────────────────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() {
-    // Install ring as the process-level rustls crypto provider.
-    // Must be called before any TLS operation.
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("Failed to install ring crypto provider");
 
     match dotenvy::dotenv() {
         Ok(path) => eprintln!("Loaded .env from {}", path.display()),
-        Err(_) => eprintln!("No .env file — using environment variables"),
+        Err(_)   => eprintln!("No .env file — using environment variables"),
     }
 
     tracing_subscriber::fmt()
@@ -586,9 +404,9 @@ async fn main() {
     let config = Config::from_env();
 
     info!(
-        debug = !config.secure_cookies,
-        excluded = ?config.excluded_paths,
-        upstream = %config.upstream_url,
+        debug           = !config.secure_cookies,
+        excluded        = ?config.excluded_paths,
+        upstream        = %config.upstream_url,
         tls_skip_verify = config.upstream_tls_skip_verify,
         "Starting auth-proxy",
     );
@@ -598,21 +416,6 @@ async fn main() {
         warp::any().map(move || c.clone())
     };
     let cookie_header = warp::header::optional::<String>("cookie");
-
-
-    // ── Route: WebSocket proxy ────────────────────────────────────────────────
-    let ws_route = warp::get()
-        .and(warp::ws())  // ← this filter only matches if Upgrade: websocket is present
-        .and(warp::path::full())
-        .and(
-            warp::query::raw()
-                .map(Some)
-                .or(warp::any().map(|| None::<String>))
-                .unify(),
-        )
-        .and(cookie_header.clone())
-        .and(with_config.clone())
-        .and_then(ws_proxy);
 
     // ── Route: logout ─────────────────────────────────────────────────────────
     let logout_route = warp::get()
@@ -631,7 +434,7 @@ async fn main() {
         .and(with_config.clone())
         .and_then(handle_auth);
 
-    // ── Route: everything else -> reverse proxy ───────────────────────────────
+    // ── Route: everything else → reverse proxy ────────────────────────────────
     let proxy_route = warp::any()
         .and(warp::addr::remote().map(|addr: Option<std::net::SocketAddr>| {
             addr.map(|a| a.ip())
@@ -650,7 +453,7 @@ async fn main() {
         .and(warp::body::bytes())
         .and_then(proxy_request);
 
-    let routes = logout_route.or(ws_route).or(auth_route).or(proxy_route);
+    let routes = logout_route.or(auth_route).or(proxy_route);
 
     let port: u16 = env::var("PORT")
         .ok()
