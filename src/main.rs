@@ -3,9 +3,16 @@ use std::env;
 use std::net::IpAddr;
 use std::sync::Arc;
 
+use axum::{
+    body::Body,
+    extract::{ConnectInfo, Request, State},
+    http::{HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::any,
+    Router,
+};
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
-use hyper::{Request, Response, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
 use hyper_util::rt::TokioExecutor;
@@ -14,8 +21,8 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{ClientConfig, DigitallySignedStruct};
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
 use tracing::info;
-use warp::{Filter, Rejection, Reply};
 
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
 #[derive(Debug, Serialize, Deserialize)]
@@ -40,6 +47,7 @@ impl ServerCertVerifier for NoVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         Ok(ServerCertVerified::assertion())
     }
+
     fn verify_tls12_signature(
         &self,
         _message: &[u8],
@@ -48,6 +56,7 @@ impl ServerCertVerifier for NoVerifier {
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
+
     fn verify_tls13_signature(
         &self,
         _message: &[u8],
@@ -56,6 +65,7 @@ impl ServerCertVerifier for NoVerifier {
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
+
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
@@ -109,6 +119,57 @@ impl Config {
     }
 }
 
+// ─── Shared app state ─────────────────────────────────────────────────────────
+#[derive(Clone)]
+struct AppState {
+    config: Config,
+    client_verified: Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>,
+    client_unverified: Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>,
+}
+
+impl AppState {
+    fn new(config: Config) -> Self {
+        let verified = {
+            let https = HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .expect("failed to load native TLS roots")
+                .https_or_http()
+                .enable_http1()
+                .enable_http2()
+                .build();
+            Client::builder(TokioExecutor::new()).build(https)
+        };
+
+        let unverified = {
+            let tls = ClientConfig::builder()
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(NoVerifier))
+                .with_no_client_auth();
+            let https = HttpsConnectorBuilder::new()
+                .with_tls_config(tls)
+                .https_or_http()
+                .enable_http1()
+                .enable_http2()
+                .build();
+            Client::builder(TokioExecutor::new()).build(https)
+        };
+
+        Self {
+            config,
+            client_verified: verified,
+            client_unverified: unverified,
+        }
+    }
+
+    fn client(&self) -> &Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>> {
+        if self.config.upstream_tls_skip_verify {
+            &self.client_unverified
+        } else {
+            &self.client_verified
+        }
+    }
+}
+
 // ─── JWT ──────────────────────────────────────────────────────────────────────
 fn validate_jwt(token: &str, secret: &str) -> bool {
     let mut v = Validation::new(Algorithm::HS256);
@@ -141,43 +202,65 @@ fn parse_cookies(header: &str) -> HashMap<String, String> {
         .collect()
 }
 
+fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| parse_cookies(s).remove(name))
+}
+
 // ─── Auth gate ────────────────────────────────────────────────────────────────
+// Returns Ok(()) if the request is authenticated, Err(redirect) otherwise.
 fn auth_gate(
     path: &str,
     original_url: &str,
-    cookie_header: &Option<String>,
+    headers: &HeaderMap,
     config: &Config,
-) -> Result<(), Response<Bytes>> {
+) -> Result<(), Response> {
     if config.is_excluded(path) {
         info!("Auth skipped (excluded path): {}", path);
         return Ok(());
     }
+
+    let cookie_header = headers
+        .get("cookie")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
 
     let cookies = cookie_header.as_deref().map(parse_cookies).unwrap_or_default();
 
     match cookies.get("access_token") {
         None => {
             info!("No token — redirecting to IAM (intended: {})", original_url);
-            Err(Response::builder()
-                .status(StatusCode::FOUND)
-                .header("Location", config.iam_login_url.as_str())
-                .header("Set-Cookie", build_cookie("intended_path", original_url, 600, false, config.secure_cookies))
-                .body(Bytes::new())
-                .unwrap())
+            Err(redirect_to_iam(original_url, vec![], config))
         }
         Some(token) if !validate_jwt(token, &config.jwt_secret) => {
             info!("Invalid/expired token — redirecting to IAM (intended: {})", original_url);
-            Err(Response::builder()
-                .status(StatusCode::FOUND)
-                .header("Location", config.iam_login_url.as_str())
-                .header("Set-Cookie", clear_cookie("access_token"))
-                .header("Set-Cookie", clear_cookie("refresh_token"))
-                .header("Set-Cookie", build_cookie("intended_path", original_url, 600, false, config.secure_cookies))
-                .body(Bytes::new())
-                .unwrap())
+            Err(redirect_to_iam(
+                original_url,
+                vec![clear_cookie("access_token"), clear_cookie("refresh_token")],
+                config,
+            ))
         }
         _ => Ok(()),
     }
+}
+
+fn redirect_to_iam(original_url: &str, extra_cookies: Vec<String>, config: &Config) -> Response {
+    let mut builder = Response::builder()
+        .status(StatusCode::FOUND)
+        .header("Location", config.iam_login_url.as_str());
+
+    for cookie in extra_cookies {
+        builder = builder.header("Set-Cookie", cookie);
+    }
+
+    builder = builder.header(
+        "Set-Cookie",
+        build_cookie("intended_path", original_url, 600, false, config.secure_cookies),
+    );
+
+    builder.body(Body::empty()).unwrap()
 }
 
 // ─── Hop-by-hop headers ───────────────────────────────────────────────────────
@@ -186,200 +269,165 @@ static HOP_BY_HOP: &[&str] = &[
     "te", "trailers", "transfer-encoding",
 ];
 
-fn strip_hop_by_hop(headers: &mut hyper::HeaderMap) {
+fn strip_hop_by_hop(headers: &mut HeaderMap) {
     for name in HOP_BY_HOP {
         headers.remove(*name);
     }
 }
 
-// ─── Hyper client ─────────────────────────────────────────────────────────────
-enum ProxyClient {
-    Verified(Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>),
-    Unverified(Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>),
-}
-
-impl ProxyClient {
-    fn new(skip_verify: bool) -> Self {
-        if skip_verify {
-            let tls = ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerifier))
-                .with_no_client_auth();
-            let https = HttpsConnectorBuilder::new()
-                .with_tls_config(tls)
-                .https_or_http()
-                .enable_http1()
-                .enable_http2()
-                .build();
-            Self::Unverified(Client::builder(TokioExecutor::new()).build(https))
-        } else {
-            let https = HttpsConnectorBuilder::new()
-                .with_native_roots()
-                .expect("failed to load native TLS roots")
-                .https_or_http()
-                .enable_http1()
-                .enable_http2()
-                .build();
-            Self::Verified(Client::builder(TokioExecutor::new()).build(https))
-        }
-    }
-
-    async fn request(
-        &self,
-        req: Request<Full<Bytes>>,
-    ) -> Result<Response<hyper::body::Incoming>, Box<dyn std::error::Error + Send + Sync>> {
-        match self {
-            Self::Verified(c)   => Ok(c.request(req).await?),
-            Self::Unverified(c) => Ok(c.request(req).await?),
-        }
-    }
-}
-
-// ─── Streaming reverse proxy ──────────────────────────────────────────────────
-// Returns Response<Bytes> — warp requires a concrete body type it knows about.
-// For watch/SSE streams this means the response is fully buffered before
-// being sent to the client. This is a warp limitation; to get true streaming
-// you would need to switch to axum or raw hyper.
-async fn reverse_proxy(
-    client_ip: IpAddr,
-    upstream_url: &str,
-    tls_skip_verify: bool,
-    method: hyper::Method,
-    path_and_query: String,
-    mut headers: hyper::HeaderMap,
-    body: Bytes,
-) -> Result<Response<Bytes>, Box<dyn std::error::Error + Send + Sync>> {
-    let target_uri: hyper::Uri = format!(
-        "{}{}",
-        upstream_url.trim_end_matches('/'),
-        path_and_query
-    ).parse()?;
-
-    strip_hop_by_hop(&mut headers);
-
-    let xff = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|existing| format!("{}, {}", existing, client_ip))
-        .unwrap_or_else(|| client_ip.to_string());
-    headers.insert("x-forwarded-for", xff.parse()?);
-
-    // Forward Host header to upstream
-    if let Ok(host) = upstream_url
-        .trim_start_matches("http://")
-        .trim_start_matches("https://")
-        .split('/')
-        .next()
-        .unwrap_or("")
-        .parse::<hyper::header::HeaderValue>()
-    {
-        headers.insert(hyper::header::HOST, host);
-    }
-
-    let mut req_builder = Request::builder().method(method).uri(target_uri);
-    *req_builder.headers_mut().unwrap() = headers;
-    let req = req_builder.body(Full::new(body))?;
-
-    let client = ProxyClient::new(tls_skip_verify);
-    let upstream_resp = client.request(req).await?;
-
-    let (mut parts, body) = upstream_resp.into_parts();
-    strip_hop_by_hop(&mut parts.headers);
-
-    // Collect the full body — required by warp's Reply bound
-    let collected = body.collect().await?.to_bytes();
-
-    Ok(Response::from_parts(parts, collected))
-}
-
 // ─── Route: logout ────────────────────────────────────────────────────────────
-async fn handle_logout() -> Result<impl Reply, Rejection> {
-    Ok(Response::builder()
+async fn handle_logout() -> Response {
+    Response::builder()
         .status(StatusCode::FOUND)
         .header("Location", "/")
         .header("Set-Cookie", clear_cookie("access_token"))
         .header("Set-Cookie", clear_cookie("refresh_token"))
         .header("Set-Cookie", clear_cookie("intended_path"))
-        .body(Bytes::new())
-        .unwrap())
+        .body(Body::empty())
+        .unwrap()
 }
 
 // ─── Route: handle-auth/:accessToken/:refreshToken ───────────────────────────
 async fn handle_auth(
-    access_token: String,
-    refresh_token: String,
-    cookie_header: Option<String>,
-    config: Config,
-) -> Result<impl Reply, Rejection> {
-    if !validate_jwt(&access_token, &config.jwt_secret) {
-        return Ok(Response::builder()
+    State(state): State<AppState>,
+    axum::extract::Path((access_token, refresh_token)): axum::extract::Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !validate_jwt(&access_token, &state.config.jwt_secret) {
+        return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header("Content-Type", "application/json")
-            .body(Bytes::from(
+            .body(Body::from(
                 serde_json::json!({ "error": "Invalid or expired token" }).to_string(),
             ))
-            .unwrap());
+            .unwrap();
     }
 
-    let cookies = cookie_header.as_deref().map(parse_cookies).unwrap_or_default();
-    let intended_path = cookies
-        .get("intended_path")
-        .cloned()
+    let intended_path = get_cookie(&headers, "intended_path")
         .unwrap_or_else(|| "/".to_string());
 
-    Ok(Response::builder()
+    Response::builder()
         .status(StatusCode::FOUND)
         .header("Location", intended_path)
-        .header("Set-Cookie", build_cookie("access_token",  &access_token,  86400,  true, config.secure_cookies))
-        .header("Set-Cookie", build_cookie("refresh_token", &refresh_token, 604800, true, config.secure_cookies))
+        .header("Set-Cookie", build_cookie("access_token",  &access_token,  86400,  true, state.config.secure_cookies))
+        .header("Set-Cookie", build_cookie("refresh_token", &refresh_token, 604800, true, state.config.secure_cookies))
         .header("Set-Cookie", clear_cookie("intended_path"))
-        .body(Bytes::new())
-        .unwrap())
+        .body(Body::empty())
+        .unwrap()
 }
 
-// ─── Route: proxy ─────────────────────────────────────────────────────────────
+// ─── Route: streaming reverse proxy ──────────────────────────────────────────
 async fn proxy_request(
-    client_addr: Option<IpAddr>,
-    cookie_header: Option<String>,
-    config: Config,
-    method: warp::http::Method,
-    path: warp::path::FullPath,
-    query: Option<String>,
-    headers: warp::http::HeaderMap,
-    body: Bytes,
-) -> Result<impl Reply, Rejection> {
-    let path_str = path.as_str();
-    let path_and_query = match &query {
-        Some(q) if !q.is_empty() => format!("{}?{}", path_str, q),
-        _ => path_str.to_string(),
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    req: Request,
+) -> Response {
+    let (parts, body) = req.into_parts();
+
+    let path = parts.uri.path();
+    let path_and_query = parts.uri
+        .path_and_query()
+        .map(|pq| pq.as_str().to_string())
+        .unwrap_or_else(|| path.to_string());
+
+    // ── Auth check ────────────────────────────────────────────────────────────
+    if let Err(redirect) = auth_gate(path, &path_and_query, &parts.headers, &state.config) {
+        return redirect;
+    }
+
+    info!("Proxying {} {}", parts.method, path_and_query);
+
+    // ── Build upstream URI ────────────────────────────────────────────────────
+    let target_uri = format!(
+        "{}{}",
+        state.config.upstream_url.trim_end_matches('/'),
+        path_and_query
+    );
+
+    let target_uri: hyper::Uri = match target_uri.parse() {
+        Ok(u) => u,
+        Err(e) => {
+            tracing::warn!("Failed to parse upstream URI: {e}");
+            return bad_gateway();
+        }
     };
 
-    if let Err(redirect) = auth_gate(path_str, &path_and_query, &cookie_header, &config) {
-        return Ok(redirect);
+    // ── Collect request body (requests are typically small) ───────────────────
+    let body_bytes = match body.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => {
+            tracing::warn!("Failed to read request body: {e}");
+            return bad_gateway();
+        }
+    };
+
+    // ── Build upstream request headers ────────────────────────────────────────
+    let mut upstream_headers = parts.headers.clone();
+    strip_hop_by_hop(&mut upstream_headers);
+
+    // X-Forwarded-For
+    let client_ip = addr.ip();
+    let xff = upstream_headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .map(|existing| format!("{}, {}", existing, client_ip))
+        .unwrap_or_else(|| client_ip.to_string());
+    if let Ok(val) = HeaderValue::from_str(&xff) {
+        upstream_headers.insert("x-forwarded-for", val);
     }
 
-    info!("Proxying {} {}", method, path_and_query);
-
-    let ip = client_addr.unwrap_or(IpAddr::from([127, 0, 0, 1]));
-
-    match reverse_proxy(
-        ip,
-        &config.upstream_url,
-        config.upstream_tls_skip_verify,
-        method,
-        path_and_query,
-        headers,
-        body,
-    ).await {
-        Ok(response) => Ok(response),
-        Err(e) => {
-            tracing::warn!("Upstream error: {:?}", e);
-            Ok(Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Bytes::from("Bad Gateway"))
-                .unwrap())
+    // Forward correct Host
+    if let Some(host) = target_uri.host() {
+        let host_val = if let Some(port) = target_uri.port() {
+            format!("{}:{}", host, port)
+        } else {
+            host.to_string()
+        };
+        if let Ok(val) = HeaderValue::from_str(&host_val) {
+            upstream_headers.insert("host", val);
         }
     }
+
+    // ── Send to upstream ──────────────────────────────────────────────────────
+    let mut upstream_req = hyper::Request::builder()
+        .method(parts.method)
+        .uri(target_uri);
+    *upstream_req.headers_mut().unwrap() = upstream_headers;
+
+    let upstream_req = match upstream_req.body(Full::new(body_bytes)) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Failed to build upstream request: {e}");
+            return bad_gateway();
+        }
+    };
+
+    let upstream_resp = match state.client().request(upstream_req).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("Upstream request failed: {e}");
+            return bad_gateway();
+        }
+    };
+
+    // ── Stream response back to client ────────────────────────────────────────
+    // axum's Body::from_stream streams chunks as they arrive — no buffering.
+    // This is what makes watch/SSE/chunked responses work correctly.
+    let (mut resp_parts, resp_body) = upstream_resp.into_parts();
+    strip_hop_by_hop(&mut resp_parts.headers);
+
+    // Convert hyper::body::Incoming → axum Body via streaming
+    let stream = resp_body.into_data_stream();
+    let axum_body = Body::from_stream(stream);
+
+    Response::from_parts(resp_parts, axum_body)
+}
+
+fn bad_gateway() -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(Body::from("Bad Gateway"))
+        .unwrap()
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -397,7 +445,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "auth_proxy=info,warp=warn".into()),
+                .unwrap_or_else(|_| "ginger_auth_proxy=info,tower_http=info".into()),
         )
         .init();
 
@@ -411,57 +459,29 @@ async fn main() {
         "Starting auth-proxy",
     );
 
-    let with_config = {
-        let c = config.clone();
-        warp::any().map(move || c.clone())
-    };
-    let cookie_header = warp::header::optional::<String>("cookie");
+    let state = AppState::new(config);
 
-    // ── Route: logout ─────────────────────────────────────────────────────────
-    let logout_route = warp::get()
-        .and(warp::path("handle-auth"))
-        .and(warp::path("logout"))
-        .and(warp::path::end())
-        .and_then(handle_logout);
-
-    // ── Route: handle-auth/:accessToken/:refreshToken ─────────────────────────
-    let auth_route = warp::get()
-        .and(warp::path("handle-auth"))
-        .and(warp::path::param::<String>())
-        .and(warp::path::param::<String>())
-        .and(warp::path::end())
-        .and(cookie_header.clone())
-        .and(with_config.clone())
-        .and_then(handle_auth);
-
-    // ── Route: everything else → reverse proxy ────────────────────────────────
-    let proxy_route = warp::any()
-        .and(warp::addr::remote().map(|addr: Option<std::net::SocketAddr>| {
-            addr.map(|a| a.ip())
-        }))
-        .and(cookie_header.clone())
-        .and(with_config.clone())
-        .and(warp::method())
-        .and(warp::path::full())
-        .and(
-            warp::query::raw()
-                .map(Some)
-                .or(warp::any().map(|| None::<String>))
-                .unify(),
-        )
-        .and(warp::header::headers_cloned())
-        .and(warp::body::bytes())
-        .and_then(proxy_request);
-
-    let routes = logout_route.or(auth_route).or(proxy_route);
+    let app = Router::new()
+        // ── Logout ────────────────────────────────────────────────────────────
+        .route("/handle-auth/logout", any(handle_logout))
+        // ── Auth callback ─────────────────────────────────────────────────────
+        .route("/handle-auth/:access_token/:refresh_token", any(handle_auth))
+        // ── Everything else → streaming proxy ─────────────────────────────────
+        .fallback(any(proxy_request))
+        .with_state(state)
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     let port: u16 = env::var("PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(3000);
 
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
+        .await
+        .expect("Failed to bind");
+
     info!("Listening on 0.0.0.0:{}", port);
     eprintln!("Listening on 0.0.0.0:{}", port);
 
-    warp::serve(routes).run(([0, 0, 0, 0], port)).await;
+    axum::serve(listener, app).await.expect("Server error");
 }
