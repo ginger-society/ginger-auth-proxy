@@ -23,6 +23,7 @@ use rustls::{ClientConfig, DigitallySignedStruct};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tracing::info;
+use futures_util::StreamExt;
 
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
 #[derive(Debug, Serialize, Deserialize)]
@@ -328,14 +329,12 @@ async fn proxy_request(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| path.to_string());
 
-    // ── Auth check ────────────────────────────────────────────────────────────
     if let Err(redirect) = auth_gate(path, &path_and_query, &parts.headers, &state.config) {
         return redirect;
     }
 
     info!("Proxying {} {}", parts.method, path_and_query);
 
-    // ── Build upstream URI ────────────────────────────────────────────────────
     let target_uri = format!(
         "{}{}",
         state.config.upstream_url.trim_end_matches('/'),
@@ -350,7 +349,6 @@ async fn proxy_request(
         }
     };
 
-    // ── Collect request body (requests are typically small) ───────────────────
     let body_bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
         Err(e) => {
@@ -359,11 +357,9 @@ async fn proxy_request(
         }
     };
 
-    // ── Build upstream request headers ────────────────────────────────────────
     let mut upstream_headers = parts.headers.clone();
     strip_hop_by_hop(&mut upstream_headers);
 
-    // X-Forwarded-For
     let client_ip = addr.ip();
     let xff = upstream_headers
         .get("x-forwarded-for")
@@ -374,7 +370,6 @@ async fn proxy_request(
         upstream_headers.insert("x-forwarded-for", val);
     }
 
-    // Forward correct Host
     if let Some(host) = target_uri.host() {
         let host_val = if let Some(port) = target_uri.port() {
             format!("{}:{}", host, port)
@@ -386,7 +381,6 @@ async fn proxy_request(
         }
     }
 
-    // ── Send to upstream ──────────────────────────────────────────────────────
     let mut upstream_req = hyper::Request::builder()
         .method(parts.method)
         .uri(target_uri);
@@ -408,17 +402,50 @@ async fn proxy_request(
         }
     };
 
-    // ── Stream response back to client ────────────────────────────────────────
-    // axum's Body::from_stream streams chunks as they arrive — no buffering.
-    // This is what makes watch/SSE/chunked responses work correctly.
+    // ── Log what upstream returned ────────────────────────────────────────────
+    tracing::info!(
+        status         = %upstream_resp.status(),
+        content_type   = ?upstream_resp.headers().get("content-type"),
+        transfer_enc   = ?upstream_resp.headers().get("transfer-encoding"),
+        content_length = ?upstream_resp.headers().get("content-length"),
+        connection     = ?upstream_resp.headers().get("connection"),
+        "upstream response headers"
+    );
+
     let (mut resp_parts, resp_body) = upstream_resp.into_parts();
     strip_hop_by_hop(&mut resp_parts.headers);
 
-    // Convert hyper::body::Incoming → axum Body via streaming
+    // ── Wrap stream with logging so we can see when/why it drops ─────────────
+    let path_for_log = path_and_query.clone();
     let stream = resp_body.into_data_stream();
-    let axum_body = Body::from_stream(stream);
+    let logged_stream = {
+        use futures_util::StreamExt;
+        stream.map(move |chunk| {
+            match &chunk {
+                Ok(b)  => tracing::debug!(path = %path_for_log, bytes = b.len(), "stream chunk"),
+                Err(e) => tracing::warn!(path = %path_for_log, "stream error: {e}"),
+            }
+            chunk
+        })
+    };
 
-    Response::from_parts(resp_parts, axum_body)
+    let axum_body = Body::from_stream(logged_stream);
+
+    let mut response = Response::from_parts(resp_parts, axum_body);
+
+    // Tell nginx not to buffer this response
+    response.headers_mut().insert(
+        "x-accel-buffering",
+        HeaderValue::from_static("no"),
+    );
+
+    tracing::info!(
+        status  = %response.status(),
+        headers = ?response.headers(),
+        "sending response to client"
+    );
+
+    response
 }
 
 fn bad_gateway() -> Response {
