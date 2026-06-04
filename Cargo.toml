@@ -20,7 +20,7 @@ rustls         = { version = "0.23", default-features = false, features = ["ring
 tokio = { version = "1", features = ["full"] }
 
 # ── Web framework ─────────────────────────────────────────────────────────────
-axum = { version = "0.7", features = ["http1", "http2", "macros"] }
+axum = { version = "0.7", features = ["http1", "http2", "macros", "ws"] }
 tower = { version = "0.4" }
 tower-http = { version = "0.5", features = ["trace"] }
 
@@ -36,6 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # ── Config ────────────────────────────────────────────────────────────────────
 dotenvy = "0.15"
 futures-util = "0.3"
+tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
 
 
 # ── Removed ───────────────────────────────────────────────────────────────────

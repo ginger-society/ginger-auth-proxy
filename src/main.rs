@@ -339,33 +339,58 @@ fn strip_hop_by_hop_response(headers: &mut HeaderMap) {
 }
 
 // ─── Route: streaming reverse proxy ──────────────────────────────────────────
+use axum::extract::ws::{WebSocket, WebSocketUpgrade, Message as AxumMsg};
+use tokio_tungstenite::tungstenite::Message as TungMsg;
+use futures_util::{SinkExt};
+
 async fn proxy_request(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    ws_upgrade: Option<WebSocketUpgrade>,
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
 
     let path = parts.uri.path().to_string();
-    let path_and_query_raw = parts.uri
+    let path_and_query = parts.uri
         .path_and_query()
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| path.clone());
-
-    // ── Rewrite watch URLs to add a long timeout so K8s keeps the stream open ─
-    let path_and_query = if path_and_query_raw.contains("watch=true")
-        && !path_and_query_raw.contains("timeoutSeconds")
-    {
-        format!("{}&timeoutSeconds=300", path_and_query_raw)
-    } else {
-        path_and_query_raw.clone()
-    };
 
     if let Err(redirect) = auth_gate(&path, &path_and_query, &parts.headers, &state.config) {
         return redirect;
     }
 
+    // ── WebSocket upgrade ─────────────────────────────────────────────────────
+    if let Some(upgrade) = ws_upgrade {
+        let upstream_url = format!(
+            "{}{}",
+            state.config.upstream_url
+                .trim_end_matches('/')
+                .replace("http://", "ws://")
+                .replace("https://", "wss://"),
+            path_and_query
+        );
+
+        tracing::info!("WebSocket upgrade → {}", upstream_url);
+
+        return upgrade.on_upgrade(move |client_ws| async move {
+            if let Err(e) = proxy_websocket(client_ws, upstream_url).await {
+                tracing::warn!("WebSocket proxy error: {e}");
+            }
+        });
+    }
+
+    // ── Regular HTTP proxy ────────────────────────────────────────────────────
     info!("Proxying {} {}", parts.method, path_and_query);
+
+    let path_and_query = if path_and_query.contains("watch=true")
+        && !path_and_query.contains("timeoutSeconds")
+    {
+        format!("{}&timeoutSeconds=300", path_and_query)
+    } else {
+        path_and_query
+    };
 
     let target_uri = format!(
         "{}{}",
@@ -392,12 +417,7 @@ async fn proxy_request(
     let mut upstream_headers = parts.headers.clone();
     strip_hop_by_hop_request(&mut upstream_headers);
 
-    // Keep connection alive to upstream
-    if let Ok(val) = HeaderValue::from_static("keep-alive").to_str() {
-        if let Ok(v) = HeaderValue::from_str(val) {
-            upstream_headers.insert("connection", v);
-        }
-    }
+    upstream_headers.insert("connection", HeaderValue::from_static("keep-alive"));
 
     let client_ip = addr.ip();
     let xff = upstream_headers
@@ -453,53 +473,81 @@ async fn proxy_request(
     let (mut resp_parts, resp_body) = upstream_resp.into_parts();
     strip_hop_by_hop_response(&mut resp_parts.headers);
 
-    // Tell nginx not to buffer this response
     resp_parts.headers.insert(
         "x-accel-buffering",
         HeaderValue::from_static("no"),
     );
 
-    // ── Stream body with logging ──────────────────────────────────────────────
-    let is_watch = path_and_query.contains("watch=true");
     let path_for_log = path_and_query.clone();
-
+    let is_watch = path_and_query.contains("watch=true");
     let stream = resp_body.into_data_stream();
-    let logged_stream = {
-        use futures_util::StreamExt;
-        stream.map(move |chunk| {
-            match &chunk {
-                Ok(b) => {
-                    if is_watch {
-                        tracing::info!(
-                            path  = %path_for_log,
-                            bytes = b.len(),
-                            "watch stream chunk"
-                        );
-                    } else {
-                        tracing::debug!(
-                            path  = %path_for_log,
-                            bytes = b.len(),
-                            "stream chunk"
-                        );
-                    }
+    let logged_stream = stream.map(move |chunk| {
+        match &chunk {
+            Ok(b) => {
+                if is_watch {
+                    tracing::info!(path = %path_for_log, bytes = b.len(), "watch chunk");
+                } else {
+                    tracing::debug!(path = %path_for_log, bytes = b.len(), "chunk");
                 }
-                Err(e) => tracing::warn!(path = %path_for_log, "stream error: {e}"),
             }
-            chunk
-        })
-    };
+            Err(e) => tracing::warn!(path = %path_for_log, "stream error: {e}"),
+        }
+        chunk
+    });
 
     let axum_body = Body::from_stream(logged_stream);
+    Response::from_parts(resp_parts, axum_body)
+}
 
-    let mut response = Response::from_parts(resp_parts, axum_body);
+async fn proxy_websocket(
+    client_ws: WebSocket,
+    upstream_url: String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (upstream_ws, _) = tokio_tungstenite::connect_async(&upstream_url).await?;
+    tracing::info!("WebSocket upstream connected: {}", upstream_url);
 
-    tracing::info!(
-        status  = %response.status(),
-        headers = ?response.headers(),
-        "sending response to client"
-    );
+    let (mut client_tx, mut client_rx) = client_ws.split();
+    let (mut up_tx, mut up_rx) = upstream_ws.split();
 
-    response
+    // client → upstream
+    let c2u = tokio::spawn(async move {
+        while let Some(Ok(msg)) = client_rx.next().await {
+            let tung = match msg {
+                AxumMsg::Text(t)   => TungMsg::Text(t.to_string().into()),
+                AxumMsg::Binary(b) => TungMsg::Binary(b.to_vec().into()),
+                AxumMsg::Ping(p)   => TungMsg::Ping(p.to_vec().into()),
+                AxumMsg::Pong(p)   => TungMsg::Pong(p.to_vec().into()),
+                AxumMsg::Close(_)  => {
+                    let _ = up_tx.send(TungMsg::Close(None)).await;
+                    break;
+                }
+            };
+            if up_tx.send(tung).await.is_err() { break; }
+        }
+        tracing::debug!("c2u done");
+    });
+
+    // upstream → client
+    let u2c = tokio::spawn(async move {
+        while let Some(Ok(msg)) = up_rx.next().await {
+            let axum_msg = match msg {
+                TungMsg::Text(t)   => AxumMsg::Text(t.to_string().into()),
+                TungMsg::Binary(b) => AxumMsg::Binary(b.to_vec().into()),
+                TungMsg::Ping(_)   => continue, // tungstenite auto-pongs
+                TungMsg::Pong(p)   => AxumMsg::Pong(p.to_vec().into()),
+                TungMsg::Close(_)  => {
+                    let _ = client_tx.send(AxumMsg::Close(None)).await;
+                    break;
+                }
+                _ => continue,
+            };
+            if client_tx.send(axum_msg).await.is_err() { break; }
+        }
+        tracing::debug!("u2c done");
+    });
+
+    tokio::join!(c2u, u2c);
+    Ok(())
 }
 
 fn bad_gateway() -> Response {
