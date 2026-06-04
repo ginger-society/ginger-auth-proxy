@@ -506,38 +506,27 @@ async fn proxy_websocket(
     upstream_url: String,
     original_headers: HeaderMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Build a proper handshake request with original headers
-    let uri: tokio_tungstenite::tungstenite::http::Uri = upstream_url.parse()?;
 
+    // Build upstream request — let tungstenite generate its own WS handshake headers,
+    // only forward cookie and authorization from the original request
     let mut handshake = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(uri);
+        .uri(upstream_url.parse::<tokio_tungstenite::tungstenite::http::Uri>()?);
 
-    // Forward relevant headers from the original browser request
-    for (name, value) in &original_headers {
-        let n = name.as_str().to_lowercase();
-        // Skip hop-by-hop and WebSocket handshake headers — tungstenite sets those
-        if matches!(n.as_str(),
-            "connection" | "upgrade" | "sec-websocket-key" |
-            "sec-websocket-version" | "sec-websocket-extensions" |
-            "sec-websocket-protocol" | "host" | "transfer-encoding"
-        ) {
-            continue;
-        }
-        if let Ok(v) = tokio_tungstenite::tungstenite::http::HeaderValue::from_bytes(value.as_bytes()) {
-            handshake = handshake.header(name.as_str(), v);
-        }
+    if let Some(cookie) = original_headers.get("cookie") {
+        handshake = handshake.header("cookie", cookie.as_bytes());
+    }
+    if let Some(auth) = original_headers.get("authorization") {
+        handshake = handshake.header("authorization", auth.as_bytes());
     }
 
     let handshake_req = handshake.body(())?;
 
     let (upstream_ws, resp) = tokio_tungstenite::connect_async(handshake_req).await?;
-    tracing::info!("WebSocket upstream connected: {} status={}", upstream_url, resp.status());
-
+    tracing::info!("WebSocket upstream connected status={}", resp.status());
 
     let (mut client_tx, mut client_rx) = client_ws.split();
     let (mut up_tx, mut up_rx) = upstream_ws.split();
 
-    // client → upstream
     let c2u = tokio::spawn(async move {
         while let Some(Ok(msg)) = client_rx.next().await {
             let tung = match msg {
@@ -555,13 +544,12 @@ async fn proxy_websocket(
         tracing::debug!("c2u done");
     });
 
-    // upstream → client
     let u2c = tokio::spawn(async move {
         while let Some(Ok(msg)) = up_rx.next().await {
             let axum_msg = match msg {
                 TungMsg::Text(t)   => AxumMsg::Text(t.to_string().into()),
                 TungMsg::Binary(b) => AxumMsg::Binary(b.to_vec().into()),
-                TungMsg::Ping(_)   => continue, // tungstenite auto-pongs
+                TungMsg::Ping(_)   => continue,
                 TungMsg::Pong(p)   => AxumMsg::Pong(p.to_vec().into()),
                 TungMsg::Close(_)  => {
                     let _ = client_tx.send(AxumMsg::Close(None)).await;
