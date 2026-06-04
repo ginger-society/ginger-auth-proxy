@@ -107,7 +107,6 @@ async fn ws_proxy(
         }
     })))
 }
-
 async fn proxy_websocket(
     client_ws: WebSocket,
     upstream_url: String,
@@ -117,9 +116,20 @@ async fn proxy_websocket(
     let (mut client_tx, mut client_rx) = client_ws.split();
     let (mut upstream_tx, mut upstream_rx) = upstream_ws.split();
 
+    // Use channels so both tasks can signal the other to stop cleanly
+    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
+
     // client → upstream
     let c2u = tokio::spawn(async move {
-        while let Some(Ok(msg)) = client_rx.next().await {
+        while let Some(result) = client_rx.next().await {
+            let msg = match result {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!("client_rx error: {e}");
+                    break;
+                }
+            };
+
             let tung_msg = if msg.is_text() {
                 Message::Text(msg.to_str().unwrap_or("").to_string().into())
             } else if msg.is_binary() {
@@ -129,33 +139,61 @@ async fn proxy_websocket(
             } else if msg.is_pong() {
                 Message::Pong(msg.as_bytes().to_vec().into())
             } else if msg.is_close() {
-                Message::Close(None)
+                let _ = upstream_tx.send(Message::Close(None)).await;
+                break;  // clean exit, not an error
             } else {
                 continue;
             };
-            if upstream_tx.send(tung_msg).await.is_err() { break; }
+
+            if let Err(e) = upstream_tx.send(tung_msg).await {
+                tracing::warn!("upstream_tx error: {e}");
+                break;
+            }
         }
+        // Signal the other direction to stop
+        let _ = close_tx.send(());
     });
 
     // upstream → client
     let u2c = tokio::spawn(async move {
-        while let Some(Ok(msg)) = upstream_rx.next().await {
-            let warp_msg = match msg {
-                Message::Text(t) => warp::ws::Message::text(t.to_string()),
-                Message::Binary(b) => warp::ws::Message::binary(b.to_vec()),
-                Message::Ping(p) => warp::ws::Message::ping(p.to_vec()),
-                Message::Pong(p) => warp::ws::Message::pong(p.to_vec()),
-                Message::Close(_) => warp::ws::Message::close(),
-                _ => continue,
-            };
-            if client_tx.send(warp_msg).await.is_err() { break; }
+        loop {
+            tokio::select! {
+                // Stop if c2u finished
+                _ = &mut close_rx => break,
+
+                msg = upstream_rx.next() => {
+                    let msg = match msg {
+                        Some(Ok(m)) => m,
+                        Some(Err(e)) => {
+                            tracing::warn!("upstream_rx error: {e}");
+                            break;
+                        }
+                        None => break, // upstream closed
+                    };
+
+                    let warp_msg = match msg {
+                        Message::Text(t)   => warp::ws::Message::text(t.to_string()),
+                        Message::Binary(b) => warp::ws::Message::binary(b.to_vec()),
+                        Message::Ping(p)   => warp::ws::Message::ping(p.to_vec()),
+                        Message::Pong(p)   => warp::ws::Message::pong(p.to_vec()),
+                        Message::Close(_)  => {
+                            let _ = client_tx.send(warp::ws::Message::close()).await;
+                            break;
+                        }
+                        _ => continue,
+                    };
+
+                    if let Err(e) = client_tx.send(warp_msg).await {
+                        tracing::warn!("client_tx error: {e}");
+                        break;
+                    }
+                }
+            }
         }
     });
 
-    tokio::select! {
-        _ = c2u => {}
-        _ = u2c => {}
-    }
+    // Wait for both to finish — don't cancel either
+    let _ = tokio::join!(c2u, u2c);
     Ok(())
 }
 
