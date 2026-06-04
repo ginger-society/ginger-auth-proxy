@@ -107,6 +107,7 @@ async fn ws_proxy(
         }
     })))
 }
+
 async fn proxy_websocket(
     client_ws: WebSocket,
     upstream_url: String,
@@ -114,86 +115,64 @@ async fn proxy_websocket(
     let (upstream_ws, _) = connect_async(&upstream_url).await?;
 
     let (mut client_tx, mut client_rx) = client_ws.split();
-    let (mut upstream_tx, mut upstream_rx) = upstream_ws.split();
+    let (mut up_tx, mut up_rx) = upstream_ws.split();
 
-    // Use channels so both tasks can signal the other to stop cleanly
-    let (close_tx, mut close_rx) = tokio::sync::oneshot::channel::<()>();
-
-    // client → upstream
+    // client → upstream: forward raw bytes, don't interpret
     let c2u = tokio::spawn(async move {
-        while let Some(result) = client_rx.next().await {
-            let msg = match result {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::warn!("client_rx error: {e}");
-                    break;
-                }
-            };
+        while let Some(Ok(msg)) = client_rx.next().await {
+            // Skip warp's auto-generated pong frames (warp sends these itself)
+            if msg.is_pong() {
+                continue;
+            }
+            if msg.is_close() {
+                let _ = up_tx.send(Message::Close(None)).await;
+                break;
+            }
 
-            let tung_msg = if msg.is_text() {
-                Message::Text(msg.to_str().unwrap_or("").to_string().into())
+            // Convert warp → tungstenite preserving raw bytes
+            let tung = if msg.is_text() {
+                match std::str::from_utf8(msg.as_bytes()) {
+                    Ok(s) => Message::Text(s.to_string().into()),
+                    Err(_) => Message::Binary(msg.as_bytes().to_vec().into()),
+                }
             } else if msg.is_binary() {
                 Message::Binary(msg.as_bytes().to_vec().into())
             } else if msg.is_ping() {
-                Message::Ping(msg.as_bytes().to_vec().into())
-            } else if msg.is_pong() {
+                // Don't forward — warp already replied; just echo as pong to upstream
                 Message::Pong(msg.as_bytes().to_vec().into())
-            } else if msg.is_close() {
-                let _ = upstream_tx.send(Message::Close(None)).await;
-                break;  // clean exit, not an error
             } else {
                 continue;
             };
 
-            if let Err(e) = upstream_tx.send(tung_msg).await {
-                tracing::warn!("upstream_tx error: {e}");
+            if up_tx.send(tung).await.is_err() {
                 break;
             }
         }
-        // Signal the other direction to stop
-        let _ = close_tx.send(());
     });
 
-    // upstream → client
+    // upstream → client: forward raw bytes, don't interpret
     let u2c = tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                // Stop if c2u finished
-                _ = &mut close_rx => break,
-
-                msg = upstream_rx.next() => {
-                    let msg = match msg {
-                        Some(Ok(m)) => m,
-                        Some(Err(e)) => {
-                            tracing::warn!("upstream_rx error: {e}");
-                            break;
-                        }
-                        None => break, // upstream closed
-                    };
-
-                    let warp_msg = match msg {
-                        Message::Text(t)   => warp::ws::Message::text(t.to_string()),
-                        Message::Binary(b) => warp::ws::Message::binary(b.to_vec()),
-                        Message::Ping(p)   => warp::ws::Message::ping(p.to_vec()),
-                        Message::Pong(p)   => warp::ws::Message::pong(p.to_vec()),
-                        Message::Close(_)  => {
-                            let _ = client_tx.send(warp::ws::Message::close()).await;
-                            break;
-                        }
-                        _ => continue,
-                    };
-
-                    if let Err(e) = client_tx.send(warp_msg).await {
-                        tracing::warn!("client_tx error: {e}");
-                        break;
-                    }
+        while let Some(Ok(msg)) = up_rx.next().await {
+            let warp_msg = match msg {
+                // tungstenite auto-replies to Ping with Pong — just forward the Pong to client
+                Message::Ping(_) => continue,  // tungstenite handled it
+                Message::Pong(p) => warp::ws::Message::pong(p.to_vec()),
+                Message::Text(t) => warp::ws::Message::text(t.to_string()),
+                Message::Binary(b) => warp::ws::Message::binary(b.to_vec()),
+                Message::Close(_) => {
+                    let _ = client_tx.send(warp::ws::Message::close()).await;
+                    break;
                 }
+                _ => continue,
+            };
+
+            if client_tx.send(warp_msg).await.is_err() {
+                break;
             }
         }
     });
 
-    // Wait for both to finish — don't cancel either
-    let _ = tokio::join!(c2u, u2c);
+    tokio::join!(c2u, u2c);
     Ok(())
 }
 
