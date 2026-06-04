@@ -346,7 +346,6 @@ use futures_util::{SinkExt};
 async fn proxy_request(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
-    ws_upgrade: Option<WebSocketUpgrade>,
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
@@ -361,27 +360,6 @@ async fn proxy_request(
         return redirect;
     }
 
-    // ── WebSocket upgrade ─────────────────────────────────────────────────────
-    if let Some(upgrade) = ws_upgrade {
-        let upstream_url = format!(
-            "{}{}",
-            state.config.upstream_url
-                .trim_end_matches('/')
-                .replace("http://", "ws://")
-                .replace("https://", "wss://"),
-            path_and_query
-        );
-
-        tracing::info!("WebSocket upgrade → {}", upstream_url);
-
-        let headers = parts.headers.clone();  // ← capture headers
-
-        return upgrade.on_upgrade(move |client_ws| async move {
-            if let Err(e) = proxy_websocket(client_ws, upstream_url, headers).await {  // ← pass headers
-                tracing::warn!("WebSocket proxy error: {e}");
-            }
-        });
-    }
 
     // ── Regular HTTP proxy ────────────────────────────────────────────────────
     info!("Proxying {} {}", parts.method, path_and_query);
