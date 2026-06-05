@@ -318,7 +318,6 @@ async fn handle_auth(
 async fn proxy_request(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
-    ws: Option<WebSocketUpgrade>,
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
@@ -329,27 +328,6 @@ async fn proxy_request(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| path.clone());
 
-    // ── WebSocket: tunnel directly, skip auth ─────────────────────────────────
-    if let Some(ws_upgrade) = ws {
-        let upstream_ws_url = format!(
-            "{}{}",
-            state.config.upstream_url
-                .trim_end_matches('/')
-                .replace("http://", "ws://")
-                .replace("https://", "wss://"),
-            path_and_query
-        );
-
-        tracing::info!("WS tunnel → {}", upstream_ws_url);
-
-        let cookie = parts.headers.get("cookie").cloned();
-
-        return ws_upgrade.on_upgrade(move |client_ws| async move {
-            if let Err(e) = tunnel_websocket(client_ws, upstream_ws_url, cookie).await {
-                tracing::warn!("WS tunnel error: {e}");
-            }
-        });
-    }
 
     // ── Auth check ────────────────────────────────────────────────────────────
     if let Err(redirect) = auth_gate(&path, &path_and_query, &parts.headers, &state.config) {
@@ -454,84 +432,6 @@ async fn proxy_request(
     Response::from_parts(resp_parts, Body::from_stream(ReceiverStream::new(rx)))
 }
 
-// ─── WebSocket tunnel ─────────────────────────────────────────────────────────
-async fn tunnel_websocket(
-    client_ws: WebSocket,
-    upstream_url: String,
-    cookie: Option<HeaderValue>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    use rand::Rng;
-
-    // Generate a valid sec-websocket-key (16 random bytes, base64 encoded)
-    let key_bytes: [u8; 16] = rand::thread_rng().gen();
-    let ws_key = STANDARD.encode(key_bytes);
-
-    let upstream_host = upstream_url
-        .trim_start_matches("ws://")
-        .trim_start_matches("wss://")
-        .split('/')
-        .next()
-        .unwrap_or("");
-
-    let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(upstream_url.parse::<tokio_tungstenite::tungstenite::http::Uri>()?)
-        .header("host", upstream_host)  
-        .header("upgrade", "websocket")
-        .header("connection", "Upgrade")
-        .header("sec-websocket-version", "13")
-        .header("sec-websocket-key", &ws_key);
-
-    if let Some(cookie_val) = cookie {
-        req = req.header("cookie", cookie_val.as_bytes());
-    }
-
-    let (upstream_ws, _) = tokio_tungstenite::connect_async(req.body(())?).await?;
-    tracing::info!("WS tunnel upstream connected");
-
-    let (mut client_tx, mut client_rx) = client_ws.split();
-    let (mut up_tx, mut up_rx) = upstream_ws.split();
-
-    // client → upstream
-    let c2u = tokio::spawn(async move {
-        while let Some(Ok(msg)) = client_rx.next().await {
-            let tung = match msg {
-                AxumMsg::Text(t)   => TungMsg::Text(t.to_string().into()),
-                AxumMsg::Binary(b) => TungMsg::Binary(b.to_vec().into()),
-                AxumMsg::Ping(p)   => TungMsg::Ping(p.to_vec().into()),
-                AxumMsg::Pong(p)   => TungMsg::Pong(p.to_vec().into()),
-                AxumMsg::Close(_)  => {
-                    let _ = up_tx.send(TungMsg::Close(None)).await;
-                    break;
-                }
-            };
-            if up_tx.send(tung).await.is_err() { break; }
-        }
-        tracing::debug!("c2u done");
-    });
-
-    // upstream → client
-    let u2c = tokio::spawn(async move {
-        while let Some(Ok(msg)) = up_rx.next().await {
-            let axum_msg = match msg {
-                TungMsg::Text(t)   => AxumMsg::Text(t.to_string().into()),
-                TungMsg::Binary(b) => AxumMsg::Binary(b.to_vec().into()),
-                TungMsg::Ping(_)   => continue, // tungstenite auto-pongs
-                TungMsg::Pong(p)   => AxumMsg::Pong(p.to_vec().into()),
-                TungMsg::Close(_)  => {
-                    let _ = client_tx.send(AxumMsg::Close(None)).await;
-                    break;
-                }
-                _ => continue,
-            };
-            if client_tx.send(axum_msg).await.is_err() { break; }
-        }
-        tracing::debug!("u2c done");
-    });
-
-    tokio::join!(c2u, u2c);
-    Ok(())
-}
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
 #[tokio::main]
