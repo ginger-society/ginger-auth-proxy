@@ -467,8 +467,16 @@ async fn tunnel_websocket(
     let key_bytes: [u8; 16] = rand::thread_rng().gen();
     let ws_key = STANDARD.encode(key_bytes);
 
+    let upstream_host = upstream_url
+        .trim_start_matches("ws://")
+        .trim_start_matches("wss://")
+        .split('/')
+        .next()
+        .unwrap_or("");
+
     let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
         .uri(upstream_url.parse::<tokio_tungstenite::tungstenite::http::Uri>()?)
+        .header("host", upstream_host)  
         .header("upgrade", "websocket")
         .header("connection", "Upgrade")
         .header("sec-websocket-version", "13")
