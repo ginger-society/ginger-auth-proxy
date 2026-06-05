@@ -21,11 +21,9 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 
 # ── Web framework ─────────────────────────────────────────────────────────────
-axum = { version = "0.7", features = ["http1", "http2", "macros", "ws"] }
+axum = { version = "0.7", features = ["http1", "http2", "macros"] }
 tower = { version = "0.4" }
 tower-http = { version = "0.5", features = ["trace"] }
-rand   = "0.8"
-base64 = "0.22"
 
 # ── Auth / serialisation ──────────────────────────────────────────────────────
 jsonwebtoken = "9"
@@ -41,8 +39,3 @@ dotenvy = "0.15"
 futures-util = "0.3"
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-native-roots"] }
 
-
-# ── Removed ───────────────────────────────────────────────────────────────────
-# hyper = "0.14"              →  hyper 1
-# warp  = "0.3"               →  warp 0.4 (hyper 1.0 native)
-# hyper-reverse-proxy = "0.5" →  replaced by inline reverse_proxy() in main.rs

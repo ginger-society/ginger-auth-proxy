@@ -10,9 +10,8 @@ use axum::{
     routing::any,
     Router,
 };
-use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message as AxumMsg};
 use bytes::Bytes;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{ StreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -24,7 +23,6 @@ use rustls::{ClientConfig, DigitallySignedStruct};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tracing::info;
 
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
