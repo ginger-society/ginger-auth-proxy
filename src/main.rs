@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::env;
-use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::{
@@ -11,8 +10,9 @@ use axum::{
     routing::any,
     Router,
 };
+use axum::extract::ws::{WebSocketUpgrade, WebSocket, Message as AxumMsg};
 use bytes::Bytes;
-use futures_util::StreamExt;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::{connect::HttpConnector, Client};
@@ -24,6 +24,7 @@ use rustls::{ClientConfig, DigitallySignedStruct};
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_tungstenite::tungstenite::Message as TungMsg;
 use tracing::info;
 
 // ─── JWT Claims ───────────────────────────────────────────────────────────────
@@ -49,7 +50,6 @@ impl ServerCertVerifier for NoVerifier {
     ) -> Result<ServerCertVerified, rustls::Error> {
         Ok(ServerCertVerified::assertion())
     }
-
     fn verify_tls12_signature(
         &self,
         _message: &[u8],
@@ -58,7 +58,6 @@ impl ServerCertVerifier for NoVerifier {
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
-
     fn verify_tls13_signature(
         &self,
         _message: &[u8],
@@ -67,7 +66,6 @@ impl ServerCertVerifier for NoVerifier {
     ) -> Result<HandshakeSignatureValid, rustls::Error> {
         Ok(HandshakeSignatureValid::assertion())
     }
-
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
         rustls::crypto::ring::default_provider()
             .signature_verification_algorithms
@@ -154,11 +152,7 @@ impl AppState {
             Client::builder(TokioExecutor::new()).build(https)
         };
 
-        Self {
-            config,
-            client_verified: verified,
-            client_unverified: unverified,
-        }
+        Self { config, client_verified: verified, client_unverified: unverified }
     }
 
     fn client(&self) -> &Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>> {
@@ -221,11 +215,7 @@ fn auth_gate(
         return Ok(());
     }
 
-    let cookie_header = headers
-        .get("cookie")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from);
-
+    let cookie_header = headers.get("cookie").and_then(|v| v.to_str().ok()).map(String::from);
     let cookies = cookie_header.as_deref().map(parse_cookies).unwrap_or_default();
 
     match cookies.get("access_token") {
@@ -249,16 +239,13 @@ fn redirect_to_iam(original_url: &str, extra_cookies: Vec<String>, config: &Conf
     let mut builder = Response::builder()
         .status(StatusCode::FOUND)
         .header("Location", config.iam_login_url.as_str());
-
     for cookie in extra_cookies {
         builder = builder.header("Set-Cookie", cookie);
     }
-
     builder = builder.header(
         "Set-Cookie",
         build_cookie("intended_path", original_url, 600, false, config.secure_cookies),
     );
-
     builder.body(Body::empty()).unwrap()
 }
 
@@ -268,23 +255,25 @@ static HOP_BY_HOP_REQ: &[&str] = &[
     "te", "trailers", "transfer-encoding", "upgrade",
 ];
 
-// NOTE: transfer-encoding intentionally NOT stripped from responses
-// so that chunked streaming works correctly end-to-end
+// transfer-encoding intentionally NOT stripped from responses
 static HOP_BY_HOP_RESP: &[&str] = &[
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers",
 ];
 
 fn strip_hop_by_hop_request(headers: &mut HeaderMap) {
-    for name in HOP_BY_HOP_REQ {
-        headers.remove(*name);
-    }
+    for name in HOP_BY_HOP_REQ { headers.remove(*name); }
 }
 
 fn strip_hop_by_hop_response(headers: &mut HeaderMap) {
-    for name in HOP_BY_HOP_RESP {
-        headers.remove(*name);
-    }
+    for name in HOP_BY_HOP_RESP { headers.remove(*name); }
+}
+
+fn bad_gateway() -> Response {
+    Response::builder()
+        .status(StatusCode::BAD_GATEWAY)
+        .body(Body::from("Bad Gateway"))
+        .unwrap()
 }
 
 // ─── Route: logout ────────────────────────────────────────────────────────────
@@ -299,7 +288,7 @@ async fn handle_logout() -> Response {
         .unwrap()
 }
 
-// ─── Route: handle-auth/:accessToken/:refreshToken ───────────────────────────
+// ─── Route: handle-auth ───────────────────────────────────────────────────────
 async fn handle_auth(
     State(state): State<AppState>,
     axum::extract::Path((access_token, refresh_token)): axum::extract::Path<(String, String)>,
@@ -309,14 +298,11 @@ async fn handle_auth(
         return Response::builder()
             .status(StatusCode::UNAUTHORIZED)
             .header("Content-Type", "application/json")
-            .body(Body::from(
-                serde_json::json!({ "error": "Invalid or expired token" }).to_string(),
-            ))
+            .body(Body::from(serde_json::json!({ "error": "Invalid or expired token" }).to_string()))
             .unwrap();
     }
 
-    let intended_path = get_cookie(&headers, "intended_path")
-        .unwrap_or_else(|| "/".to_string());
+    let intended_path = get_cookie(&headers, "intended_path").unwrap_or_else(|| "/".to_string());
 
     Response::builder()
         .status(StatusCode::FOUND)
@@ -328,17 +314,11 @@ async fn handle_auth(
         .unwrap()
 }
 
-fn bad_gateway() -> Response {
-    Response::builder()
-        .status(StatusCode::BAD_GATEWAY)
-        .body(Body::from("Bad Gateway"))
-        .unwrap()
-}
-
-// ─── Route: streaming reverse proxy ──────────────────────────────────────────
+// ─── Route: proxy ─────────────────────────────────────────────────────────────
 async fn proxy_request(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<std::net::SocketAddr>,
+    ws: Option<WebSocketUpgrade>,
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
@@ -349,41 +329,53 @@ async fn proxy_request(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_else(|| path.clone());
 
+    // ── WebSocket: tunnel directly, skip auth ─────────────────────────────────
+    if let Some(ws_upgrade) = ws {
+        let upstream_ws_url = format!(
+            "{}{}",
+            state.config.upstream_url
+                .trim_end_matches('/')
+                .replace("http://", "ws://")
+                .replace("https://", "wss://"),
+            path_and_query
+        );
+
+        tracing::info!("WS tunnel → {}", upstream_ws_url);
+
+        let cookie = parts.headers.get("cookie").cloned();
+
+        return ws_upgrade.on_upgrade(move |client_ws| async move {
+            if let Err(e) = tunnel_websocket(client_ws, upstream_ws_url, cookie).await {
+                tracing::warn!("WS tunnel error: {e}");
+            }
+        });
+    }
+
+    // ── Auth check ────────────────────────────────────────────────────────────
     if let Err(redirect) = auth_gate(&path, &path_and_query, &parts.headers, &state.config) {
         return redirect;
     }
 
     info!("Proxying {} {}", parts.method, path_and_query);
 
-    let target_uri = format!(
+    let target_uri: hyper::Uri = match format!(
         "{}{}",
         state.config.upstream_url.trim_end_matches('/'),
         path_and_query
-    );
-
-    let target_uri: hyper::Uri = match target_uri.parse() {
+    ).parse() {
         Ok(u) => u,
-        Err(e) => {
-            tracing::warn!("Failed to parse upstream URI: {e}");
-            return bad_gateway();
-        }
+        Err(e) => { tracing::warn!("Bad URI: {e}"); return bad_gateway(); }
     };
 
-    // Collect request body — requests are typically small (not streaming)
     let body_bytes = match body.collect().await {
         Ok(b) => b.to_bytes(),
-        Err(e) => {
-            tracing::warn!("Failed to read request body: {e}");
-            return bad_gateway();
-        }
+        Err(e) => { tracing::warn!("Body read error: {e}"); return bad_gateway(); }
     };
 
-    // Build upstream request headers
     let mut upstream_headers = parts.headers.clone();
     strip_hop_by_hop_request(&mut upstream_headers);
     upstream_headers.insert("connection", HeaderValue::from_static("keep-alive"));
 
-    // X-Forwarded-For
     let client_ip = addr.ip();
     let xff = upstream_headers
         .get("x-forwarded-for")
@@ -394,36 +386,27 @@ async fn proxy_request(
         upstream_headers.insert("x-forwarded-for", val);
     }
 
-    // Host
     if let Some(host) = target_uri.host() {
         let host_val = match target_uri.port() {
-            Some(port) => format!("{}:{}", host, port),
-            None       => host.to_string(),
+            Some(p) => format!("{}:{}", host, p),
+            None    => host.to_string(),
         };
         if let Ok(val) = HeaderValue::from_str(&host_val) {
             upstream_headers.insert("host", val);
         }
     }
 
-    let mut upstream_req = hyper::Request::builder()
-        .method(parts.method)
-        .uri(target_uri);
+    let mut upstream_req = hyper::Request::builder().method(parts.method).uri(target_uri);
     *upstream_req.headers_mut().unwrap() = upstream_headers;
 
     let upstream_req = match upstream_req.body(Full::new(body_bytes)) {
         Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("Failed to build upstream request: {e}");
-            return bad_gateway();
-        }
+        Err(e) => { tracing::warn!("Request build error: {e}"); return bad_gateway(); }
     };
 
     let upstream_resp = match state.client().request(upstream_req).await {
         Ok(r) => r,
-        Err(e) => {
-            tracing::warn!("Upstream request failed: {e}");
-            return bad_gateway();
-        }
+        Err(e) => { tracing::warn!("Upstream error: {e}"); return bad_gateway(); }
     };
 
     tracing::info!(
@@ -431,22 +414,14 @@ async fn proxy_request(
         content_type   = ?upstream_resp.headers().get("content-type"),
         transfer_enc   = ?upstream_resp.headers().get("transfer-encoding"),
         content_length = ?upstream_resp.headers().get("content-length"),
-        connection     = ?upstream_resp.headers().get("connection"),
-        "upstream response headers"
+        "upstream response"
     );
 
     let (mut resp_parts, resp_body) = upstream_resp.into_parts();
     strip_hop_by_hop_response(&mut resp_parts.headers);
+    resp_parts.headers.insert("x-accel-buffering", HeaderValue::from_static("no"));
 
-    // Tell nginx not to buffer
-    resp_parts.headers.insert(
-        "x-accel-buffering",
-        HeaderValue::from_static("no"),
-    );
-
-    // ── Stream body via channel with capacity 1 ───────────────────────────────
-    // Channel capacity 1 forces each chunk to be delivered immediately before
-    // the next is read — prevents any internal buffering of streaming responses.
+    // ── Stream via channel (capacity 1 = no buffering) ────────────────────────
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Bytes, std::io::Error>>(1);
     let path_for_log = path_and_query.clone();
     let is_watch = path_and_query.contains("watch=true");
@@ -457,17 +432,9 @@ async fn proxy_request(
             match chunk {
                 Ok(bytes) => {
                     if is_watch {
-                        tracing::info!(
-                            path  = %path_for_log,
-                            bytes = bytes.len(),
-                            "watch chunk"
-                        );
+                        tracing::info!(path = %path_for_log, bytes = bytes.len(), "watch chunk");
                     } else {
-                        tracing::debug!(
-                            path  = %path_for_log,
-                            bytes = bytes.len(),
-                            "chunk"
-                        );
+                        tracing::debug!(path = %path_for_log, bytes = bytes.len(), "chunk");
                     }
                     if tx.send(Ok(bytes)).await.is_err() {
                         tracing::debug!(path = %path_for_log, "client disconnected");
@@ -476,10 +443,7 @@ async fn proxy_request(
                 }
                 Err(e) => {
                     tracing::warn!(path = %path_for_log, "stream error: {e}");
-                    let _ = tx.send(Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        e.to_string(),
-                    ))).await;
+                    let _ = tx.send(Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))).await;
                     break;
                 }
             }
@@ -487,8 +451,67 @@ async fn proxy_request(
         tracing::debug!(path = %path_for_log, "stream ended");
     });
 
-    let axum_body = Body::from_stream(ReceiverStream::new(rx));
-    Response::from_parts(resp_parts, axum_body)
+    Response::from_parts(resp_parts, Body::from_stream(ReceiverStream::new(rx)))
+}
+
+// ─── WebSocket tunnel ─────────────────────────────────────────────────────────
+async fn tunnel_websocket(
+    client_ws: WebSocket,
+    upstream_url: String,
+    cookie: Option<HeaderValue>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
+        .uri(upstream_url.parse::<tokio_tungstenite::tungstenite::http::Uri>()?);
+
+    if let Some(cookie_val) = cookie {
+        req = req.header("cookie", cookie_val.as_bytes());
+    }
+
+    let (upstream_ws, _) = tokio_tungstenite::connect_async(req.body(())?).await?;
+    tracing::info!("WS tunnel upstream connected");
+
+    let (mut client_tx, mut client_rx) = client_ws.split();
+    let (mut up_tx, mut up_rx) = upstream_ws.split();
+
+    // client → upstream
+    let c2u = tokio::spawn(async move {
+        while let Some(Ok(msg)) = client_rx.next().await {
+            let tung = match msg {
+                AxumMsg::Text(t)   => TungMsg::Text(t.to_string().into()),
+                AxumMsg::Binary(b) => TungMsg::Binary(b.to_vec().into()),
+                AxumMsg::Ping(p)   => TungMsg::Ping(p.to_vec().into()),
+                AxumMsg::Pong(p)   => TungMsg::Pong(p.to_vec().into()),
+                AxumMsg::Close(_)  => {
+                    let _ = up_tx.send(TungMsg::Close(None)).await;
+                    break;
+                }
+            };
+            if up_tx.send(tung).await.is_err() { break; }
+        }
+        tracing::debug!("c2u done");
+    });
+
+    // upstream → client
+    let u2c = tokio::spawn(async move {
+        while let Some(Ok(msg)) = up_rx.next().await {
+            let axum_msg = match msg {
+                TungMsg::Text(t)   => AxumMsg::Text(t.to_string().into()),
+                TungMsg::Binary(b) => AxumMsg::Binary(b.to_vec().into()),
+                TungMsg::Ping(_)   => continue, // tungstenite auto-pongs
+                TungMsg::Pong(p)   => AxumMsg::Pong(p.to_vec().into()),
+                TungMsg::Close(_)  => {
+                    let _ = client_tx.send(AxumMsg::Close(None)).await;
+                    break;
+                }
+                _ => continue,
+            };
+            if client_tx.send(axum_msg).await.is_err() { break; }
+        }
+        tracing::debug!("u2c done");
+    });
+
+    tokio::join!(c2u, u2c);
+    Ok(())
 }
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
