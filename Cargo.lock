@@ -420,6 +420,7 @@ name = "ginger-auth-proxy"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
  "bytes",
  "dotenvy",
  "futures-util",
@@ -428,6 +429,7 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "jsonwebtoken",
+ "rand",
  "rustls 0.23.40",
  "serde",
  "serde_json",

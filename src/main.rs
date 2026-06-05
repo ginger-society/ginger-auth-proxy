@@ -460,8 +460,19 @@ async fn tunnel_websocket(
     upstream_url: String,
     cookie: Option<HeaderValue>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use rand::Rng;
+
+    // Generate a valid sec-websocket-key (16 random bytes, base64 encoded)
+    let key_bytes: [u8; 16] = rand::thread_rng().gen();
+    let ws_key = STANDARD.encode(key_bytes);
+
     let mut req = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(upstream_url.parse::<tokio_tungstenite::tungstenite::http::Uri>()?);
+        .uri(upstream_url.parse::<tokio_tungstenite::tungstenite::http::Uri>()?)
+        .header("upgrade", "websocket")
+        .header("connection", "Upgrade")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", &ws_key);
 
     if let Some(cookie_val) = cookie {
         req = req.header("cookie", cookie_val.as_bytes());
