@@ -153,6 +153,10 @@ impl Config {
     /// when no prefix is configured, so existing root-mounted deployments
     /// are completely unaffected.
     fn to_public_path(&self, internal_path: &str) -> String {
+        if self.public_path_prefix.is_empty()
+            || internal_path.starts_with(&self.public_path_prefix) {
+            return internal_path.to_string();
+        }
         format!("{}{}", self.public_path_prefix, internal_path)
     }
 }
@@ -514,11 +518,13 @@ async fn main() {
         "Starting auth-proxy",
     );
 
-    let state = AppState::new(config);
+    let state = AppState::new(config.clone());
 
     let app = Router::new()
-        .route("/handle-auth/logout", any(handle_logout))
-        .route("/handle-auth/:access_token/:refresh_token", any(handle_auth))
+        .nest(&config.public_path_prefix, Router::new()
+            .route("/handle-auth/logout", any(handle_logout))
+            .route("/handle-auth/:access_token/:refresh_token", any(handle_auth))
+        )
         .fallback(any(proxy_request))
         .with_state(state)
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
