@@ -391,10 +391,18 @@ async fn proxy_request(
 
     info!("Proxying {} {}", parts.method, path_and_query);
 
+    let upstream_path = if !state.config.public_path_prefix.is_empty() {
+        path_and_query
+            .strip_prefix(&state.config.public_path_prefix)
+            .unwrap_or(&path_and_query)
+    } else {
+        &path_and_query
+    };
+
     let target_uri: hyper::Uri = match format!(
         "{}{}",
         state.config.upstream_url.trim_end_matches('/'),
-        path_and_query
+        upstream_path
     ).parse() {
         Ok(u) => u,
         Err(e) => { tracing::warn!("Bad URI: {e}"); return bad_gateway(); }
