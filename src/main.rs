@@ -80,6 +80,20 @@ struct Config {
     secure_cookies: bool,
     excluded_paths: Vec<String>,
     upstream_tls_skip_verify: bool,
+    /// External path prefix this proxy is mounted under, as seen by the
+    /// browser (e.g. "/dashboard"). Empty by default, which preserves the
+    /// old behavior for deployments that sit at the root of their host.
+    ///
+    /// Why this is needed: when an Ingress strips this prefix via
+    /// `rewrite-target` before forwarding to this proxy, `parts.uri`
+    /// inside this app never contains it — the proxy only ever sees the
+    /// upstream-relative path. Any path this proxy later hands back to
+    /// the browser to navigate to (intended_path, the post-auth redirect
+    /// Location) must have the prefix re-attached, or the browser is sent
+    /// to a path the public Ingress has no route for — which, for an
+    /// auth flow specifically, manifests as a redirect loop back to login
+    /// instead of landing on the originally requested page.
+    public_path_prefix: String,
 }
 
 impl Config {
@@ -100,6 +114,23 @@ impl Config {
             .map(String::from)
             .collect();
 
+        // Normalize to "" or "/prefix" (no trailing slash) so every call
+        // site can just do `format!("{}{}", prefix, path)` without having
+        // to separately worry about double slashes or a missing leading
+        // slash depending on how the operator wrote the env var.
+        let raw_prefix = env::var("PUBLIC_PATH_PREFIX")
+            .unwrap_or_default()
+            .trim()
+            .trim_end_matches('/')
+            .to_string();
+        let public_path_prefix = if raw_prefix.is_empty() {
+            String::new()
+        } else if raw_prefix.starts_with('/') {
+            raw_prefix
+        } else {
+            format!("/{raw_prefix}")
+        };
+
         Config {
             jwt_secret:     env::var("JWT_SECRET_KEY").expect("JWT_SECRET_KEY must be set"),
             upstream_url:   env::var("UPSTREAM_URL").expect("UPSTREAM_URL must be set"),
@@ -107,6 +138,7 @@ impl Config {
             secure_cookies: !debug,
             excluded_paths,
             upstream_tls_skip_verify,
+            public_path_prefix,
         }
     }
 
@@ -114,6 +146,14 @@ impl Config {
         self.excluded_paths
             .iter()
             .any(|prefix| path.starts_with(prefix.as_str()))
+    }
+
+    /// Re-attach the external prefix to a proxy-internal path before
+    /// handing it back to the browser. No-op (returns the path unchanged)
+    /// when no prefix is configured, so existing root-mounted deployments
+    /// are completely unaffected.
+    fn to_public_path(&self, internal_path: &str) -> String {
+        format!("{}{}", self.public_path_prefix, internal_path)
     }
 }
 
@@ -240,9 +280,16 @@ fn redirect_to_iam(original_url: &str, extra_cookies: Vec<String>, config: &Conf
     for cookie in extra_cookies {
         builder = builder.header("Set-Cookie", cookie);
     }
+    // `original_url` is `path_and_query` as THIS proxy received it — i.e.
+    // already stripped of any external prefix by an upstream Ingress
+    // rewrite. Re-attach that prefix here so that when IAM later redirects
+    // the browser back to this value, it lands on a path the public
+    // Ingress can actually route, instead of looping back through the
+    // proxy's own internal-relative path again.
+    let public_intended_path = config.to_public_path(original_url);
     builder = builder.header(
         "Set-Cookie",
-        build_cookie("intended_path", original_url, 600, false, config.secure_cookies),
+        build_cookie("intended_path", &public_intended_path, 600, false, config.secure_cookies),
     );
     builder.body(Body::empty()).unwrap()
 }
@@ -300,6 +347,11 @@ async fn handle_auth(
             .unwrap();
     }
 
+    // `intended_path` was stored (in redirect_to_iam) as a PUBLIC path —
+    // i.e. already including this proxy's external prefix, if any — so it
+    // can be used directly as the redirect Location without modification.
+    // The "/" fallback is likewise a public, root-of-host path and needs
+    // no prefix attached either.
     let intended_path = get_cookie(&headers, "intended_path").unwrap_or_else(|| "/".to_string());
 
     Response::builder()
@@ -453,10 +505,11 @@ async fn main() {
     let config = Config::from_env();
 
     info!(
-        debug           = !config.secure_cookies,
-        excluded        = ?config.excluded_paths,
-        upstream        = %config.upstream_url,
-        tls_skip_verify = config.upstream_tls_skip_verify,
+        debug               = !config.secure_cookies,
+        excluded            = ?config.excluded_paths,
+        upstream            = %config.upstream_url,
+        tls_skip_verify     = config.upstream_tls_skip_verify,
+        public_path_prefix  = %config.public_path_prefix,
         "Starting auth-proxy",
     );
 
