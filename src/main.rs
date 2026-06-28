@@ -352,7 +352,8 @@ async fn handle_auth(
     // can be used directly as the redirect Location without modification.
     // The "/" fallback is likewise a public, root-of-host path and needs
     // no prefix attached either.
-    let intended_path = get_cookie(&headers, "intended_path").unwrap_or_else(|| "/".to_string());
+    let intended_path = get_cookie(&headers, "intended_path")
+    .unwrap_or_else(|| state.config.to_public_path("/"));
 
     Response::builder()
         .status(StatusCode::FOUND)
